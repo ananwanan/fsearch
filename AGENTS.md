@@ -17,16 +17,20 @@ FSearch 是基于 Rust 的轻量、高性能、跨平台桌面文件搜索工具
 
 优先级：**正确性与可靠性 > 可感知的交互响应 > 经基准测试证实的性能 > 界面特效**。不能为了“快”牺牲结果正确性。
 
-## 2. 当前仓库事实（写于 2026-10）
+## 2. 当前仓库事实（更新于 2026-10-11）
 
 当前为 Rust 2021 的 CLI 原型，不是已完成的 egui 桌面软件：
-- `Cargo.toml`：包名 `search`，Rust edition 2021；当前仅依赖 `clap`。
-- `src/main.rs`：解析 `--directory` 和 `--filename`，调用扫描和查找函数；以 `dbg!` 输出匹配结果。
-- `src/helper/args_helper.rs`：CLI 参数。
-- `src/helper/file_helper.rs`：`get_file_list` 递归扫描路径，`find_file` 匹配路径字符串。
-- `.github/workflows/rust.yml`：现有 CI 执行 `cargo build` / `cargo test`。
+- 根 `Cargo.toml` 为虚拟 workspace，resolver `2`；成员是 `crates/fsearch-core` 与 `crates/fsearch-cli`，默认成员为 CLI。共享 version、Rust edition 2021 和 `clap` 依赖约束，保留根 `Cargo.lock` 和 release profile。
+- `crates/fsearch-core/src/lib.rs`：公开与 CLI / GUI 无关的扫描和匹配接口；核心无外部依赖。
+- `crates/fsearch-core/src/search.rs`：`SearchMode::{ExactName, ExactPath, NameSubstring, PathSubstring}` 与 `find_paths`，使用原始 `OsStr` 进行区分大小写的字面匹配，不进行规范化或 fuzzy 评分。
+- `crates/fsearch-core/src/scanner.rs`：`scan_path` 迭代扫描，保留原始 `PathBuf`；`ScanReport` 返回路径与子条目问题，`ScanIssue` 保留路径、操作和原始 I/O 错误。
+- `crates/fsearch-cli/src/main.rs` 与 `args.rs`：CLI 包名 / binary 名保持 `search`，两个原有必填参数 `--directory` / `-d` 和 `--filename` / `-f` 保留，默认搜索完整路径连续子串。
+- `crates/fsearch-cli/tests/cli.rs` 与核心单元测试：CLI 行为、匹配语义及扫描边界回归。
+- `.github/workflows/rust.yml`：配置 Windows / Linux / macOS 的 fmt、workspace test、Clippy 和 release build；远端执行结果需另行验证。
 
-务必注意：目前 `find_file(..., Some(false))` 固定为子串模式，对**完整路径字符串**进行区分大小写的 `contains` 匹配；所谓 exact 分支比较的也是**完整路径字符串相等**。尚未提供用户可选的精确搜索、字符序列模糊匹配、持久化索引、GUI、后台索引或文件监视。不要在 README、发布说明、UI 或测试中误称这些能力已经上线。
+务必注意：CLI 固定为 `PathSubstring`，`--filename` 是历史参数名，不表示仅匹配 basename。相对扫描根保留相对路径，目录根本身不入结果，文件 / 链接根作为单条候选；空子串查询匹配全部候选。扫描默认不跟随符号链接或 Windows reparse point（包括 junction），不提供可选跟随策略。根错误报告 `Scan failed` 并退出 `1`；子条目错误报告 `Scan incomplete`，继续输出部分匹配并退出 `1`；合法空目录和无匹配退出 `0`，参数错误由 clap 退出 `2`。结果保留输入序列，无全局排序保证。CLI 仍以 `dbg!` 向 stderr 输出，debug 构建在有匹配时向 stdout 输出耗时，合法空目录保留 `File list not found`。
+
+核心已区分文件名 / 完整路径精确匹配和两种子串范围，但尚未提供用户可选的 CLI 搜索模式、大小写开关、字符序列模糊匹配、持久化索引、GUI、后台任务、过滤设置或文件监视。不要在 README、发布说明、UI 或测试中误称这些能力已经上线。
 
 ## 3. 技术选型
 
@@ -40,29 +44,31 @@ FSearch 是基于 Rust 的轻量、高性能、跨平台桌面文件搜索工具
 
 **不要为了追求最新版本盲目添加依赖**；新增依赖需检查维护状态、许可证、跨平台支持、构建体积和供应链风险。保留并更新 `Cargo.lock`（应用项目）。
 
-## 4. 推荐架构（演进方向，并非现有目录）
+## 4. workspace 架构与演进方向
 
-在完成 CLI 行为回归测试后，逐步将 UI 与搜索核心拆开。推荐模块职责：
+当前已将搜索核心与 CLI 分为独立 crate：
 
 ```text
-src/
-  main.rs              # 程序入口 / 启动方式
-  app/                 # eframe 应用状态、事件和视图
-  search/              # 搜索查询模型、匹配、评分、排序
-  scanner/             # 文件系统枚举、过滤、权限与错误处理
-  index/               # 可选的索引构建、更新、快照、持久化
-  platform/            # 受控的平台适配：打开、定位、路径行为
-  config/              # 设置及持久化
-tests/                 # 端到端与边界用例
-benches/               # 性能基准（需要时建立）
+Cargo.toml                         # 虚拟 workspace、共享依赖 / edition / profile
+Cargo.lock                         # 应用项目锁文件
+crates/
+  fsearch-core/
+    src/lib.rs                     # 公共核心接口
+    src/search.rs                  # 匹配语义
+    src/scanner.rs                 # 枚举、原始路径与结构化错误
+  fsearch-cli/
+    src/main.rs                    # search 可执行文件入口
+    src/args.rs                    # CLI 参数
+    tests/cli.rs                   # CLI 回归测试
 ```
 
-这些路径是目标结构，不是要求一次性建立所有空目录。可以保留 CLI 作为调试/回归工具，但搜索核心不应依赖 `egui` / `eframe` / CLI 参数类型。优先使用清晰的数据模型和稳定的模块边界，避免过度抽象或微服务式拆分。
+未来 egui / eframe 桌面入口可新增 workspace 成员，负责应用状态、事件和视图；索引、平台操作、配置、基准等模块按实际需求建立，不提前创建空目录。保留 CLI 作为调试 / 回归工具；搜索核心不应依赖 `egui` / `eframe` / CLI 参数类型。优先使用清晰的数据模型和稳定的模块边界，避免过度抽象或微服务式拆分。
 
 ### 4.1 数据模型
 
 建议建立类似 `SearchQuery`、`SearchMode`、`SearchOptions`、`SearchResult`、`FileEntry` 的显式类型：
-- `SearchMode` 至少区分 `ExactName`、`ExactPath`、`Substring`、`Fuzzy`。
+- 当前 `SearchMode` 已区分 `ExactName`、`ExactPath`、`NameSubstring`、`PathSubstring`；未来增加 `Fuzzy` 时必须实现真正的非连续匹配及评分，不能把子串模式改名冒充模糊匹配。
+- 当前扫描模型为 `ScanReport { paths, issues }`，问题模型为 `ScanIssue { path, operation, error }`；根错误与子条目部分失败分别处理，不能用空结果掩盖失败。
 - 保存系统原始路径（`PathBuf` / `OsString`）；不要把 `to_string_lossy()` 生成的展示字符串作为文件系统真值。
 - 文件和目录标志、大小、时间、搜索分数等元数据按需延迟读取。
 - 结果 ID 与扫描/索引世代（generation）可用于防止旧任务覆盖新结果。
@@ -72,8 +78,8 @@ benches/               # 性能基准（需要时建立）
 
 精确匹配和模糊匹配必须是可独立测试、可解释的模式：
 1. **ExactName**：文件名与查询完全相等，而不是完整路径是否包含查询。
-2. **ExactPath**：按平台适用的规则比较指定完整路径；是否规范化及大小写敏感由选项明确决定。
-3. **Substring**：文件名（或显式选择的路径范围）包含连续查询字符串。
+2. **ExactPath**：当前按原始 `OsStr` 路径拼写比较，不调用 `canonicalize`。若未来增加平台路径规则、规范化或大小写选项，应明确改变的语义。
+3. **NameSubstring / PathSubstring**：分别在文件名或完整候选路径的原生编码中匹配连续字面子串，空查询匹配全部适用候选。当前四种模式均区分大小写，不做 Unicode 规范化或大小写折叠。
 4. **Fuzzy**：支持非连续字符的有序匹配及评分，不能把 `contains` 冒充 fuzzy；可采用 subsequence、边界/连续命中奖励与有上界的编辑距离等明确算法。
 
 默认匹配范围、大小写策略、Unicode 规范化策略必须在 UI/文档中明确。Unicode case-folding、路径规范化和平台文件系统大小写语义不能简单混为一谈；文件访问始终使用原始路径。
@@ -85,6 +91,7 @@ benches/               # 性能基准（需要时建立）
 - 使用迭代遍历或有界队列，避免极深目录造成无限递归或栈风险。
 - 处理 `read_dir` 失败、权限不足、文件消失、路径不可解码等情况；返回结构化错误或部分结果与错误统计，不应随意 `unwrap`。
 - 符号链接策略需明确，默认避免跟随目录链接导致循环；如允许跟随则做去重/环检测。
+- 当前检查根的最终组件及枚举发现的链接，忽略根检查路径的末尾分隔符 / `.`，但结果与错误保留原始输入；显式输入路径中的祖先链接仍由系统解析。排队目录打开前再次检查，`std::fs` 的检查与打开不构成原子 no-follow 保证。
 - 支持排除目录、隐藏文件与系统路径规则；避免无意扫描网络盘、系统敏感目录或无限范围。
 - 索引更新采用分批处理和可取消任务；持久化时使用版本化结构、原子替换与损坏恢复。
 - 文件系统监听属于后续优化；漏事件、溢出和断线时提供重新扫描兜底机制。
@@ -111,19 +118,19 @@ benches/               # 性能基准（需要时建立）
 - 结果展示延迟、输入响应、滚动表现与文件变更后的可见性。
 - 不同文件规模、磁盘介质、长路径/Unicode 场景下的差异。
 
-构建可重复的临时目录基准数据集，记录 OS、Rust 版本、硬件、构建 profile、文件数量和查询集合。使用 `cargo build --release` 进行真实体验评估；性能改进要同时考虑最坏情况、正确性与回归风险。避免无界线程池、对每次输入重新全量扫描、每帧克隆完整结果或批量读取文件内容。
+构建可重复的临时目录基准数据集，记录 OS、Rust 版本、硬件、构建 profile、文件数量和查询集合。使用 `cargo build --workspace --release --locked` 进行真实体验评估；性能改进要同时考虑最坏情况、正确性与回归风险。避免无界线程池、对每次输入重新全量扫描、每帧克隆完整结果或批量读取文件内容。
 
 ## 6. 质量和测试
 
 每次涉及代码的变更至少运行（环境允许时）：
 ```sh
 cargo fmt --all -- --check
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo build --release
+cargo test --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --workspace --release --locked
 ```
 
-若环境不支持某命令，明确报告**未运行**和原因，不得声称测试通过。保留现有 CLI 行为测试，改变行为时应同步更新文档与用例。
+根默认成员只包含 CLI，质量检查必须显式包含 `--workspace`，避免漏测核心。若环境不支持某命令，明确报告**未运行**和原因，不得声称测试通过。保留现有 CLI 行为测试，改变行为时应同步更新文档与用例。三平台 CI 配置与本地 Windows 通过均不能代替远端 Linux / macOS 的实际验证。
 
 测试重点：
 - 精确文件名与精确完整路径的区别；大小写敏感开关。
@@ -155,6 +162,13 @@ cargo build --release
 - **P3：桌面体验完善**：文件变更追踪、稳定重建索引、平台差异适配、键盘无障碍、主题、多语言及发布打包。
 
 每个阶段必须形成可运行、可测试的增量成果。不要把计划里的 feature 当成已经存在的 API。
+
+### 2026-10-11 需求完成记录
+
+- 已完成：Cargo workspace 重构；无外部依赖的核心与 `search` CLI 分层；保留原 CLI 参数和默认匹配行为；精确文件名 / 路径及两个子串范围的显式模式；原始路径匹配；迭代扫描；不跟随链接 / Windows reparse point；结构化根错误、子条目部分结果与退出状态；核心及 CLI 基础回归用例；三平台 CI 检查配置。
+- 本地验收：Windows，Rust / Cargo 1.99.0；`cargo fmt --all -- --check`、`cargo test --workspace --all-targets --locked`（23 个核心测试、11 个 CLI 测试）、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`cargo build --workspace --release --locked` 全部通过；根目录 `cargo run --release --locked -- -d ./crates -f search.rs` 已验证默认入口和 release 输出。原型在迁移前的 9 个 CLI 回归测试也已通过。
+- P0 剩余：将搜索模式和大小写策略开放为用户选项，补充对应回归；进一步验证权限、网络路径、长路径及更多平台边界。P0 未全部完结，P1–P3 仍按路线推进。
+- 验证边界：Linux / macOS、Unix 特有的非 UTF-8 文件系统路径与权限测试、真实 Windows 权限拒绝、网络路径及极长磁盘路径尚未验证，远端 CI 尚未运行。本次未引入 GUI、索引、后台任务、fuzzy、排序或筛选规则；扫描仍全量驻留内存，不是文件系统快照，尚无可复现的性能对照数据，不因完成重构宣称更快、低内存或全部平台已通过。
 
 ## 9. 文档维护
 

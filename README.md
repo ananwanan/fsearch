@@ -17,19 +17,25 @@ FSearch 旨在使用 **Rust + egui / eframe** 打造一款“小而美”的跨�
 
 ## 当前已实现
 
-仓库目前采用 **Rust 2021**，依赖 `clap` 提供简单 CLI：
-- 支持传入起始目录并递归枚举子目录下的条目。
-- 支持以**区分大小写的子串匹配**查找：目前查询针对**完整路径字符串**，并非仅文件名。
-- 使用 `dbg!` 输出匹配结果；调试构建时额外输出耗时。
-- 现有 GitHub Actions 运行基本构建和测试工作流。
+仓库采用 **Rust 2021 Cargo workspace**，搜索核心与 CLI 分离：
+- `fsearch-core` 无外部依赖，提供迭代扫描和可独立测试的路径匹配。
+- CLI 包名与可执行文件名仍为 `search`，通过 `clap` 解析参数；在仓库根目录运行 `cargo run` 默认启动 CLI。
+- 支持扫描目录中的文件、子目录和链接，目录根本身不作为结果；文件根或链接根作为单条候选。
+- 扫描与匹配保留原始 `PathBuf` / `OsStr`，无需把非 UTF-8 路径转成有损字符串；默认不跟随符号链接或 Windows reparse point（包括 junction）。
+- CLI 保留**区分大小写的完整路径连续子串匹配**，空查询匹配全部候选。相对输入保持相对路径，不会自动转成绝对路径。
+- 核心提供 `ExactName`、`ExactPath`、`NameSubstring`、`PathSubstring` 四种模式；CLI 尚未提供模式选择参数。
+- 根路径错误明确失败；子条目错误保留部分结果与结构化错误，CLI 报告扫描不完整。
+- 使用 `dbg!` 向 stderr 输出匹配结果；调试构建仅在存在匹配时向 stdout 输出耗时。
+- 提供核心单元测试和 CLI 回归测试；GitHub Actions 配置 Windows、Linux、macOS 的格式、测试、Clippy 和 release 构建检查。远端运行结果需另行确认。
 
 **目前的限制**：
-- 命令行尚无搜索模式参数：`main.rs` 固定调用 `find_file(..., Some(false))`。
-- 内部 exact 分支是完整路径字符串相等，不是文件名精确匹配。
-- `contains` 只是连续子串匹配，不属于真正的 fuzzy search。
-- 没有索引和文件系统变更监听；每次运行都重新递归遍历。
+- 四种核心模式均区分大小写，不进行 Unicode 规范化、大小写折叠或路径规范化；`ExactPath` 比较原始路径拼写，不调用 `canonicalize`。
+- 子串模式按系统路径的原生编码做字面连续匹配；不支持通配符、正则或真正的 fuzzy search。
+- 匹配保留扫描输入顺序，没有全局稳定排序；扫描不是文件系统快照，条目可能在扫描后消失。
+- 链接检查针对根的最终组件及枚举发现的链接，根末尾分隔符或 `.` 不会绕过检查；显式输入路径中的祖先链接仍由系统解析。元数据检查与打开目录并非原子操作，无法保证并发替换期间绝不跟随链接。
+- 没有索引和文件系统变更监听；每次运行都重新遍历，扫描路径全部驻留内存，尚无大规模性能基准。
 - 尚未提供 GUI、后台扫描、取消搜索及持久化设置。
-- 现有遍历实现对某些 I/O 错误、符号链接循环与非 UTF-8 路径等边界情况尚不完善。
+- 尚无仅文件/仅目录、隐藏条目、排除目录等筛选选项。当前改动不代表全部目标平台已验证。
 
 ## 运行当前 CLI 原型
 
@@ -53,18 +59,29 @@ cargo run --release -- --directory . --filename Cargo
 例如：
 
 ```bash
-cargo run --release -- -d ./src -f helper
+cargo run --release -- -d ./crates -f search.rs
 ```
 
 注意：示例展示的是**已有 CLI**，其输出仍是调试格式。`--filename` 这个参数名并不代表目前只搜索 basename。
 
-## 目标功能（尚未实现）
+退出与输出约定：
+
+| 情况 | 输出 | 退出码 |
+| --- | --- | --- |
+| 扫描完整且有匹配 | stderr 的 `dbg!` 结果；debug 构建另有 stdout 耗时 | `0` |
+| 扫描完整且无匹配 | 无结果或耗时输出 | `0` |
+| 合法空目录 | stdout 输出 `File list not found` | `0` |
+| 根路径不存在或不能读取 | stderr 输出 `Scan failed` 和错误详情 | `1` |
+| 子条目读取失败 | stderr 输出 `Scan incomplete`，继续输出已取得的匹配 | `1` |
+| 缺少或无效的 CLI 参数 | `clap` 错误提示 | `2` |
+
+## 目标功能（使用者入口尚未提供）
 
 | 功能 | 期望行为 |
 | --- | --- |
-| 文件名精确搜索 | 输入 `report.pdf` 只匹配同名文件（可配置大小写规则） |
-| 完整路径精确搜索 | 按定义明确的路径规则查询唯一位置 |
-| 子串搜索 | 输入 `report` 查找文件名包含连续片段的条目 |
+| 文件名精确搜索 | 将核心 `ExactName` 开放给 CLI / GUI，并增加可配置的大小写规则 |
+| 完整路径精确搜索 | 将核心 `ExactPath` 开放给 CLI / GUI，明确是否提供额外的路径比较规则 |
+| 文件名子串搜索 | 将核心 `NameSubstring` 开放给 CLI / GUI；当前 CLI 固定搜索完整路径 |
 | 真正的模糊搜索 | 输入 `rptpdf` 也可命中 `report.pdf` 等相关文件，并进行评分排序 |
 | 高性能索引 | 首次扫描后复用索引，并支持增量更新与必要时重建 |
 | egui 图形界面 | 搜索框、模式选择、范围设置、结果列表、搜索进度和状态反馈 |
@@ -72,7 +89,27 @@ cargo run --release -- -d ./src -f helper
 | 实用操作 | Enter 打开文件、复制路径、打开所在目录、键盘导航 |
 | 个性化 | 浅色/深色主题、缩放、过滤规则与设置持久化 |
 
-以上是**路线图与设计目标**，不是当前版本的已实现功能或性能承诺。
+以上是**路线图与设计目标**；核心已经具备的四种字面匹配模式见“当前已实现”，其余能力尚未上线，不构成性能承诺。
+
+## 当前 workspace 结构
+
+```text
+Cargo.toml                  # 虚拟 workspace，共享版本、edition 和依赖
+Cargo.lock                  # 应用锁文件
+crates/
+  fsearch-core/
+    Cargo.toml              # 无外部依赖
+    src/lib.rs              # 核心公共接口
+    src/scanner.rs          # 原始路径扫描、部分结果和错误
+    src/search.rs           # 文件名 / 路径精确及子串匹配
+  fsearch-cli/
+    Cargo.toml              # 包名 search
+    src/main.rs             # CLI 入口、输出和退出状态
+    src/args.rs             # clap 参数
+    tests/cli.rs            # 可执行文件行为回归
+```
+
+根 workspace 使用 resolver `2`，`default-members` 指向 CLI。`clap` 版本约束共享于根 manifest，现有锁定版本和 release 构建配置保留，没有新增外部依赖。核心不依赖 CLI 参数类型或 GUI 库，未来桌面入口可作为新的 workspace 成员接入。
 
 ## 规划中的程序架构
 
@@ -104,16 +141,18 @@ cargo run --release -- -d ./src -f helper
 3. **P2 — 性能升级**：可复用索引、真正的模糊匹配与评分、增量刷新、查询取消和性能基准。
 4. **P3 — 发布质量**：文件变更追踪、设置持久化、跨平台回归测试、打包和视觉细节。
 
+2026-10-11 已完成 P0 的 workspace 重构、核心 / CLI 分层、四种匹配语义、原始路径与迭代扫描、结构化错误和基础回归用例。P0 尚未全部完成：CLI 搜索模式选项、大小写开关与更完整的平台边界覆盖仍待推进；P1–P3 仍为计划。
+
 ## 开发与贡献
 
 ```bash
 cargo fmt --all -- --check
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo build --release
+cargo test --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --workspace --release --locked
 ```
 
-目前 GitHub Actions 只包含基本的 build / test 检查；上面的命令是开发时推荐的本地质量检查，并不表示当前 CI 已运行全部检查。
+多成员 workspace 应使用 `--workspace` 检查全部成员；根目录默认命令只选择 CLI。GitHub Actions 已配置上述检查的三平台矩阵，但配置存在不表示远端已通过；本地 Windows 检查也不能替代 Linux / macOS 验证。
 
 项目贡献应坚持最小依赖、清晰模块边界、明确搜索语义、无 UI 主线程阻塞。开发规范及面向 Codex 的任务约束请参阅 [AGENTS.md](AGENTS.md)。
 

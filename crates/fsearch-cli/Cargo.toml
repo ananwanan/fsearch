@@ -1,0 +1,9 @@
+[package]
+name = "search"
+version.workspace = true
+edition.workspace = true
+description = "FSearch command-line prototype"
+
+[dependencies]
+clap.workspace = true
+fsearch-core.workspace = true

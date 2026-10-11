@@ -1,12 +1,17 @@
-[package]
-name = "search"
+[workspace]
+members = ["crates/fsearch-core", "crates/fsearch-cli"]
+default-members = ["crates/fsearch-cli"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+[workspace.dependencies]
+fsearch-core = { path = "crates/fsearch-core" }
+clap = { version = "4.5.26", features = ["derive"] }
 
 [profile.release]
 debug = false
 lto = true
 panic = "abort"
-
-[dependencies]
-clap = { version = "4.5.26", features = ["derive"] }

@@ -11,12 +11,23 @@ env:
 
 jobs:
   build:
-
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
     - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
+    - name: Set up stable Rust
+      run: |
+        rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+        rustup default stable
+    - name: Check formatting
+      run: cargo fmt --all -- --check
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --workspace --all-targets --locked
+    - name: Run Clippy
+      run: cargo clippy --workspace --all-targets --locked -- -D warnings
+    - name: Build release
+      run: cargo build --workspace --release --locked
