@@ -249,18 +249,48 @@ fn relative_root_preserves_relative_result_paths() -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn native_name_fixture_supported(result: io::Result<()>) -> io::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            #[cfg(target_os = "macos")]
+            if error.raw_os_error() == Some(92) {
+                // Darwin EILSEQ: this filesystem rejects invalid UTF-8 names.
+                eprintln!(
+                    "SKIPPED native-filename filesystem assertions: the filesystem \
+                     rejected an invalid UTF-8 fixture name: {error}"
+                );
+                return Ok(false);
+            }
+            Err(error)
+        }
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn non_utf8_root_and_file_names_preserve_native_paths() -> io::Result<()> {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 
+    let assert_rejected_root = |root: &Path| -> io::Result<()> {
+        let output = search(root, "ascii-hit", false)?;
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Scan failed:"));
+        assert!(output.stdout.is_empty());
+        Ok(())
+    };
     let directory = TestDirectory::new()?;
     let root = directory
         .path()
         .join(OsString::from_vec(b"root-\xff".to_vec()));
-    fs::create_dir(&root)?;
+    if !native_name_fixture_supported(fs::create_dir(&root))? {
+        return assert_rejected_root(&root);
+    }
     let file = root.join(OsString::from_vec(b"ascii-hit-\xfe.txt".to_vec()));
-    fs::write(&file, b"native path fixture")?;
+    if !native_name_fixture_supported(fs::write(&file, b"native path fixture"))? {
+        return assert_rejected_root(&file);
+    }
 
     let output = search(&root, "ascii-hit", false)?;
     assert_nonempty_output(&output);
@@ -281,7 +311,7 @@ impl PermissionsGuard {
         use std::os::unix::fs::PermissionsExt;
 
         let original = fs::metadata(path)?.permissions();
-        fs::set_permissions(path, fs::Permissions::from_mode(0))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000))?;
         Ok(Self {
             path: path.to_path_buf(),
             original,
