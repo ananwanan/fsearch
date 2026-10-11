@@ -1,202 +1,189 @@
-# AGENTS.md — FSearch 开发规范
+# FSearch — Agent Development Guide
 
-> 本文件用于指导 Codex 和其他代码代理维护、重构与扩展 FSearch。执行任务前先阅读本文件及 README.md；以仓库真实代码为准，不要把规划功能当作已实现功能。
+This file defines the engineering contract for AI coding agents (including Codex) and contributors working in this repository. **Read this file, `README.md`, relevant source files, and tests before changing code.** Repository state is authoritative; this guide is not a substitute for inspecting implementations.
 
-## 1. 产品定位
+## 1. Mission and non-negotiable priorities
 
-FSearch 是基于 Rust 的轻量、高性能、跨平台桌面文件搜索工具，GUI **统一采用 egui + eframe**。
+FSearch is a **small, polished, fast desktop file-name and path search application**, built in Rust with **egui/eframe**. It targets Windows, Linux, and macOS, subject to actual build and runtime verification.
 
-产品关键词：**快、准、轻、小而美**。
+1. **Correctness and filesystem safety first.** Never invent results, discard errors silently, or confuse a partial scan with a complete index.
+2. **Responsiveness.** Scanning, indexing, matching large datasets, metadata I/O, and OS actions must stay off the GUI render path.
+3. **Measured performance.** Favor low-latency searches, predictable RAM/CPU usage, quick startup, and small distributables, but benchmark before claiming improvements.
+4. **Exact and fuzzy search with explicit semantics.** Literal substring matching is **not** fuzzy matching.
+5. **Minimalism.** Keep UX clean, keyboard-friendly, accessible, and dependencies justified. Do not replace egui with Qt, Flutter, Electron, Tauri, or a WebView.
 
-核心目标：
-- 快：大目录遍历、索引建立、查询和列表滚动都应保持良好响应性；测量后再优化。
-- 准：区分文件名精确匹配、完整路径精确匹配、子串匹配和真正的模糊匹配，不得混淆。
-- 轻：尽量减少启动时间、二进制体积、空闲 CPU 占用、内存与磁盘占用。
-- 美：简洁统一的 egui 视觉语言，优秀的键盘交互和合理的信息密度。
-- 稳：正确处理权限错误、无效路径、符号链接、非 UTF-8 文件名及大规模目录。
+Never advertise an unimplemented feature as shipping. Avoid unrelated refactors, artificial abstractions, or a wholesale rewrite.
 
-优先级：**正确性与可靠性 > 可感知的交互响应 > 经基准测试证实的性能 > 界面特效**。不能为了“快”牺牲结果正确性。
+## 2. Repository snapshot (2026-10-11)
 
-## 2. 当前仓库事实（更新于 2026-10-11）
-
-当前为 Rust 2021 workspace，包含可用的 egui 桌面 MVP 和保留的 CLI 原型；持久化索引、真正 fuzzy 和文件监听尚未实现：
-
-- 根 `Cargo.toml` 为虚拟 workspace，resolver `2`；成员是 `crates/fsearch-core`、`crates/fsearch-cli` 与 `crates/fsearch-desktop`，默认成员为 CLI。共享 version、Rust edition 2021 与 `clap` / `eframe` 依赖约束，保留根 `Cargo.lock` 和 release profile。
-- `crates/fsearch-core/src/lib.rs`：公开与 CLI / GUI 无关的扫描和匹配接口；核心无外部依赖。
-- `crates/fsearch-core/src/search.rs`：`SearchMode::{ExactName, ExactPath, NameSubstring, PathSubstring}`、`find_paths` 与公开的单候选 `matches_path`，使用原始 `OsStr` 进行区分大小写的字面匹配，不进行规范化或 fuzzy 评分。
-- `crates/fsearch-core/src/scanner.rs`：`scan_path` 迭代扫描，保留原始 `PathBuf`；`ScanReport` 返回路径与子条目问题，`ScanIssue` 保留路径、操作和原始 I/O 错误。新增 `scan_path_with`、`ScanProgress`、`ScanOutcome`，支持回调进度与协作取消；原 `scan_path` 兼容保留。
-- `crates/fsearch-cli/src/main.rs` 与 `args.rs`：CLI 包名 / binary 名保持 `search`，两个原有必填参数 `--directory` / `-d` 和 `--filename` / `-f` 保留，默认搜索完整路径连续子串。
-- `crates/fsearch-cli/tests/cli.rs` 与核心单元测试：CLI 行为、匹配语义及扫描边界回归。
-- `crates/fsearch-desktop/src/main.rs` / `app.rs`：包与 binary 为 `fsearch-desktop`，通过 eframe 启动桌面界面；包含四种模式、范围、类型筛选、虚拟列表、状态、键盘操作、主题 / 缩放 / 中英文等会话设置。
-- `crates/fsearch-desktop/src/worker.rs`：单后台扫描 / 查询线程、175 ms 输入防抖配合、独立扫描 / 查询 generation、取消与会话内存缓存；后台生成元数据 / 展示文本并按原始路径排序，`Arc` 快照和 8 项有界事件通道，进度约 100 ms 更新，最多发布 20,000 个结果索引并保留全命中统计。
-- `crates/fsearch-desktop/src/platform.rs`：独立有界后台 action worker，Windows ShellExecuteW / PIDL 定位、macOS `open` / `open -R`、Linux `xdg-open`；启动阶段读取可选本机 CJK 字体。
-- `.github/workflows/rust.yml`：配置 Windows / Linux / macOS 的 fmt、workspace test、Clippy 和 release build；远端执行结果需另行验证。
-
-务必注意：CLI 固定为 `PathSubstring`，`--filename` 是历史参数名，不表示仅匹配 basename。相对扫描根保留相对路径，目录根本身不入结果，文件 / 链接根作为单条候选；空子串查询匹配全部候选。扫描默认不跟随符号链接或 Windows reparse point（包括 junction），不提供可选跟随策略。根错误报告 `Scan failed` 并退出 `1`；子条目错误报告 `Scan incomplete`，继续输出部分匹配并退出 `1`；合法空目录和无匹配退出 `0`，参数错误由 clap 退出 `2`。结果保留输入序列，无全局排序保证。CLI 仍以 `dbg!` 向 stderr 输出，debug 构建在有匹配时向 stdout 输出耗时，合法空目录保留 `File list not found`。
-
-桌面通过 `cargo run -p fsearch-desktop --release --locked` 启动。可选参数为 `--directory` / `-d`、`--query` / `-q`、`--mode`（`exact-name`、`exact-path`、`name-substring`、`path-substring`，默认文件名子串）；指定根时自动扫描，不指定时只预填工作目录，等用户粘贴 / 拖入路径后扫描。未加入原生路径选择器。扫描完成后发布缓存，后续查询复用该缓存，不因输入重新扫描。
-
-桌面类型筛选为全部 / 仅文件 / 仅目录，链接和其他条目只在“全部”中显示。快捷键为 Ctrl+L 聚焦查询、方向键选择、Enter 打开、Ctrl+Shift+C 复制路径、Ctrl+O 定位、Ctrl+R 重扫、Escape 取消任务（空闲时清空查询），提供双击及鼠标按钮。中文 / English、深色 / 浅色、缩放仅当前会话生效；无 CJK 字体时默认 English 并禁用中文。长路径显示截断，hover 展示全文；非 UTF-8 展示与文本复制可能有损，打开和匹配保持原始路径。
-
-Windows 定位使用完整项 PIDL 打开父目录并选中条目，API 路径长度最多 259 个 UTF-16 单元；Linux 定位仅打开父目录，不保证选中条目。核心与 CLI 保持原扫描次序，桌面按原始路径稳定排序。未提供 CLI 模式选择、可选大小写策略、fuzzy、持久化 / 增量索引、流式大目录索引、设置持久化、排除目录规则或文件监视。不要在 README、发布说明、UI 或测试中误称这些能力已经上线。
-
-## 3. 技术选型
-
-- 语言：Rust，保持代码安全、可维护，遵循仓库 edition；升级 edition 需独立说明。
-- GUI：`egui + eframe`；不要引入 Qt、Flutter、Tauri、WebView、Electron 或第二套 GUI。
-- 并发：优先标准库线程/通道；有数据和理由时再引入 `rayon`、`crossbeam` 等。
-- 扫描：优先使用 `std::fs` / `std::path`，按实际需求评估 `walkdir` / `ignore` / 平台 API。
-- 匹配：自行实现清晰可测的基线逻辑；如使用 `memchr`、`aho-corasick`、`regex`、`nucleo-matcher` 等，应附性能/正确性依据。
-- 索引持久化：只有明确数据模型、崩溃恢复与迁移方案后才引入数据库或序列化格式。
-- 配置和日志：保持依赖精简，不加入未使用的基础设施。
-
-当前桌面新增的直接外部依赖仅为既定 GUI 框架 [`eframe 0.36.2`](https://docs.rs/eframe/0.36.2/eframe/)（MIT OR Apache-2.0），通过其 re-export 使用 egui；该框架承担原生窗口、渲染和平台输入，不引入第二套 GUI。桌面成员 MSRV 为 Rust 1.95，本次开发工具链为 1.99。`default-features = false`，启用 `accesskit` / `default_fonts` / `glow` / `wayland` / `x11`，只用 Glow / OpenGL 后端，不启用 WGPU。锁文件可能列出未启用的可选 / 平台依赖，判断构建内容应以实际 `cargo tree -p fsearch-desktop` 为准；框架传递依赖与体积、资源开销需实际测量，不能以“只加一个直接依赖”推断包体很小。
-
-**不要为了追求最新版本盲目添加依赖**；新增依赖需检查维护状态、许可证、跨平台支持、构建体积和供应链风险。保留并更新 `Cargo.lock`（应用项目）。
-
-## 4. workspace 架构与演进方向
-
-当前搜索核心、CLI 与桌面分别为独立 crate：
+The repository is a Rust **2021 Cargo virtual workspace** with `resolver = "2"` and three crates. Root `default-members` selects only the CLI, not the desktop app.
 
 ```text
-Cargo.toml                         # 虚拟 workspace、共享依赖 / edition / profile
-Cargo.lock                         # 应用项目锁文件
+Cargo.toml                      workspace, shared dependencies, release profile
+Cargo.lock                      committed application lockfile
+.github/workflows/rust.yml      Windows/Linux/macOS fmt, tests, Clippy, release builds
 crates/
   fsearch-core/
-    src/lib.rs                     # 公共核心接口
-    src/search.rs                  # 匹配语义
-    src/scanner.rs                 # 枚举、原始路径与结构化错误
+    src/lib.rs                  public, UI-independent scan/match API
+    src/scanner.rs              iterative scan, native paths, issues, progress, cancellation
+    src/search.rs               four literal search modes, unit tests
   fsearch-cli/
-    src/main.rs                    # search 可执行文件入口
-    src/args.rs                    # CLI 参数
-    tests/cli.rs                   # CLI 回归测试
+    src/args.rs                 legacy CLI args
+    src/main.rs                 executable: search
+    tests/cli.rs                CLI regressions
   fsearch-desktop/
-    src/main.rs                    # eframe 启动与初始参数
-    src/app.rs                     # 应用状态、视图与会话设置
-    src/model.rs                   # generation 校验、取消状态与结果选择
-    src/worker.rs                  # 后台扫描 / 缓存 / 查询与取消
-    src/platform.rs                # 后台文件操作与启动字体加载
+    src/main.rs                 eframe/Glow launcher and startup flags
+    src/app.rs                  egui UI, preferences, keyboard/mouse interactions
+    src/model.rs                view state, generation checks, selection/cancel logic
+    src/worker.rs               background scanning, session cache, filtering, queries
+    src/platform.rs             background file-open/reveal actions, optional system fonts
+README.md                       English user documentation
+README.zh-CN.md                 Chinese user documentation
+AGENTS.md                       this development guide
 ```
 
-桌面入口负责应用状态、事件和视图，扫描 / 查询耗时工作与系统文件操作分别在后台运行；索引持久化、配置持久化、基准等模块按实际需求建立，不提前创建空目录。保留 CLI 作为调试 / 回归工具；搜索核心不应依赖 `egui` / `eframe` / CLI 参数类型。优先使用清晰的数据模型和稳定的模块边界，避免过度抽象或微服务式拆分。
+Current manifests specify `eframe 0.36.2` with default features disabled and `accesskit`, `default_fonts`, `glow`, `wayland`, `x11` enabled; there is no WGPU renderer configuration. The desktop crate declares `rust-version = "1.95"`. `fsearch-core` has no external dependencies. Changes to MSRV, graphics backend, or dependencies require separate justification and lockfile maintenance.
 
-### 4.1 数据模型
+### What exists today
 
-建议建立类似 `SearchQuery`、`SearchMode`、`SearchOptions`、`SearchResult`、`FileEntry` 的显式类型：
+- Iterative, one-off scanning via `scan_path` / `scan_path_with`. `ScanReport` preserves native `PathBuf` entries and structured `ScanIssue` records; `ScanProgress` and `ScanOutcome` support cooperative cancellation. Roots that are individual files/links are accepted. A directory root itself is not included. Symlinks and Windows reparse points (including junctions) are not traversed by default. No atomic no-follow guarantee exists across metadata checks and subsequent opens.
+- `SearchMode::{ExactName, ExactPath, NameSubstring, PathSubstring}`, `find_paths`, and `matches_path`. **All four modes are literal, case-sensitive, non-normalizing, and non-fuzzy.** Name modes operate on the final path component; path modes operate on the complete, original path spelling. Substrings are contiguous matches using native encoded bytes. Empty substring queries match all applicable entries; empty exact queries match no normal entries. Core and CLI preserve scan order.
+- Legacy `search` CLI: required `-d/--directory` and `-f/--filename`; its default behavior is **full-path substring**, despite the historic flag name. Root failure is an error (exit 1), recoverable child failures print `Scan incomplete` and also exit 1 while preserving partial results, empty/no matches exit 0, and clap argument errors exit 2. Matches still use `dbg!` on stderr; debug builds print timing on stdout when matches exist.
+- `fsearch-desktop`: optional `-d/--directory`, `-q/--query`, `--mode` = `exact-name` / `exact-path` / `name-substring` / `path-substring` (default). A specified root triggers scanning; otherwise the working directory is prefilled but scanning waits for user action. There is no native folder picker; users may paste or drop paths.
+- Desktop has a UI for the four modes, root and file/directory filtering; a **175 ms** query debounce; one background scan/query worker; separate scan/query generations, cooperative cancellation, an **8-event bounded channel**, approximately 100 ms progress updates, an `Arc`-shared in-session snapshot, stable native-path ordering, virtualized visible rows, and a **20,000-result display cap** with a full match count. The display cap does **not** cap scan/cache memory. New queries reuse the current snapshot rather than re-scanning.
+- Actions run on a separate background worker: Windows Shell/PIDL open and reveal, macOS `open` / `open -R`, Linux `xdg-open`. Linux reveal opens the containing directory but may not select the item; Windows item selection currently has a 259 UTF-16-unit API limit. The app offers Ctrl+L, arrows, Enter/double-click, Ctrl+Shift+C, Ctrl+O, Ctrl+R, Escape; equivalent command shortcuts are used on macOS where appropriate. Light/dark, scale, and English/Chinese are **session-only**. Chinese availability depends on a discoverable local CJK font. Non-UTF-8 display/copy may be lossy even though core filesystem operations preserve native paths.
 
-- 当前 `SearchMode` 已区分 `ExactName`、`ExactPath`、`NameSubstring`、`PathSubstring`；未来增加 `Fuzzy` 时必须实现真正的非连续匹配及评分，不能把子串模式改名冒充模糊匹配。
-- 当前扫描模型为 `ScanReport { paths, issues }`，问题模型为 `ScanIssue { path, operation, error }`；根错误与子条目部分失败分别处理，不能用空结果掩盖失败。
-- `scan_path_with` 的同步进度回调在扫描线程运行，返回 `false` 时得到 `ScanOutcome { report, cancelled }`；已观察的部分报告保留，正在执行的系统 I/O 不能强行中断，GUI 不得在帧内调用该扫描接口。
-- 保存系统原始路径（`PathBuf` / `OsString`）；不要把 `to_string_lossy()` 生成的展示字符串作为文件系统真值。
-- 文件和目录标志、大小、时间、搜索分数等元数据按需延迟读取。
-- 结果 ID 与扫描/索引世代（generation）可用于防止旧任务覆盖新结果。
-- 清晰区分仅搜索文件、仅搜索目录、两者都搜索的过滤选项。
+**Not implemented:** native MFT enumeration, USN Journal tracking, persistent or incremental indices, filesystem watchers, true fuzzy search/ranking, configurable case folding, glob/regex/content search, persistent settings, exclusion rules, native folder selection, or comprehensive large-tree benchmarks. Do not imply these exist.
 
-### 4.2 匹配语义
+## 3. Layering rules and evolution
 
-精确匹配和模糊匹配必须是可独立测试、可解释的模式：
-1. **ExactName**：文件名与查询完全相等，而不是完整路径是否包含查询。
-2. **ExactPath**：当前按原始 `OsStr` 路径拼写比较，不调用 `canonicalize`。若未来增加平台路径规则、规范化或大小写选项，应明确改变的语义。
-3. **NameSubstring / PathSubstring**：分别在文件名或完整候选路径的原生编码中匹配连续字面子串，空查询匹配全部适用候选。当前四种模式均区分大小写，不做 Unicode 规范化或大小写折叠。
-4. **Fuzzy**：支持非连续字符的有序匹配及评分，不能把 `contains` 冒充 fuzzy；可采用 subsequence、边界/连续命中奖励与有上界的编辑距离等明确算法。
+Keep `fsearch-core` independent of `clap` and `egui/eframe`; it must remain testable without a GUI. CLI and desktop adapt their own input/output to core APIs. Keep platform-specific privileged access and file reveal/open behavior behind narrow interfaces. Avoid creating empty crates or introducing database/async runtimes until an incremental working slice requires them.
 
-默认匹配范围、大小写策略、Unicode 规范化策略必须在 UI/文档中明确。Unicode case-folding、路径规范化和平台文件系统大小写语义不能简单混为一谈；文件访问始终使用原始路径。
+**Target architecture (planned; not the existing implementation):**
 
-建议排序：模式相关分数、文件名命中优先级、路径深度等明确的稳定次序；同分时使用确定性 tie-breaker，避免结果闪烁。空查询、超长查询和无结果状态要有明确定义。
+```text
+egui/eframe UI ── commands/events ── application/search coordinator
+                                        │
+                                in-memory index snapshot
+                                        │
+                      ┌─────────────────┴──────────────────┐
+                      │                                    │
+             Windows NTFS backend                  portable scan backend
+             MFT metadata enumeration             directory traversal
+             USN Journal delta feed               optional watch + reconciliation
+                      └─────────────────┬──────────────────┘
+                             query / filtering / ranking
+                                        │
+                              bounded result batches
+```
 
-### 4.3 扫描与索引
+Use explicit concepts when needed: `SearchQuery`, `SearchMode`, `SearchOptions`, `IndexedEntry`, `IndexSnapshot`, `IndexProgress`, and `IndexHealth`. Do **not** introduce a speculative public trait hierarchy before implementing a second backend. Preserve the working scanner and CLI as fallback and regression checks.
 
-- 使用迭代遍历或有界队列，避免极深目录造成无限递归或栈风险。
-- 处理 `read_dir` 失败、权限不足、文件消失、路径不可解码等情况；返回结构化错误或部分结果与错误统计，不应随意 `unwrap`。
-- 符号链接策略需明确，默认避免跟随目录链接导致循环；如允许跟随则做去重/环检测。
-- 当前检查根的最终组件及枚举发现的链接，忽略根检查路径的末尾分隔符 / `.`，但结果与错误保留原始输入；显式输入路径中的祖先链接仍由系统解析。排队目录打开前再次检查，`std::fs` 的检查与打开不构成原子 no-follow 保证。
-- 支持排除目录、隐藏文件与系统路径规则；避免无意扫描网络盘、系统敏感目录或无限范围。
-- 索引更新采用分批处理和可取消任务；持久化时使用版本化结构、原子替换与损坏恢复。
-- 文件系统监听属于后续优化；漏事件、溢出和断线时提供重新扫描兜底机制。
-- 大结果集需限制内存驻留、批量传输、增量渲染，不能因百万级条目阻塞 UI。
+## 4. Everything-inspired filesystem indexing (future work)
 
-### 4.4 并发与 GUI
+The high-performance goal is to **scan once, query an index repeatedly, and apply changes incrementally**. This is a design plan, not a claim of Everything compatibility or equivalent speed.
 
-- **egui 的每帧 update/render 内绝不进行同步深度扫描、磁盘 I/O 或大规模排序**。
-- 扫描、索引和耗时查询运行于后台 worker，通过线程安全通道汇报进度/结果。
-- 支持查询防抖、取消、generation 校验，旧查询结果不可覆盖最新查询。
-- 使用 egui 的高效列表/虚拟滚动机制，只布局可见行。
-- 仅在状态变化时请求重绘，避免空闲时无意义高帧率和高 CPU。
-- GUI 默认应包含：搜索框、搜索模式切换、搜索范围、结果列表、状态/进度、必要的设置入口。
-- 键盘体验优先：焦点进入搜索框、方向键导航、Enter 打开文件、快捷键复制路径/打开所在目录；提供鼠标等价操作。
-- 主题支持浅色/深色、合理缩放、高 DPI、多语言与长路径省略；不为装饰引入沉重资源包。
-- 路径打开行为必须通过平台适配层调用正确系统 API，严禁拼接未经转义的 shell 命令。
+### 4.1 NTFS fast path on Windows
 
-## 5. 性能工程
+- Prefer documented Windows filesystem control APIs. Explore opening a supported NTFS volume with `CreateFileW`, invoking `DeviceIoControl` / `FSCTL_ENUM_USN_DATA` to enumerate file records efficiently, querying journal information using `FSCTL_QUERY_USN_JOURNAL`, and reading subsequent updates via `FSCTL_READ_USN_JOURNAL`.
+- The NTFS Master File Table (MFT) underlies file records. `FSCTL_ENUM_USN_DATA` is a supported filesystem enumeration interface; **do not describe it as parsing raw MFT bytes**. The USN Journal is for changes, not an everlasting, lossless event queue.
+- Build parent/child relationships from volume identity, file reference number (FRN/file ID), parent FRN, original name, and entry flags. Resolve paths correctly, including moves/renames, multiple names/hard links, reparse points, and roots. Treat ID reuse and varying file-ID widths/formats explicitly.
+- Associate index snapshots with volume/journal identity and an observed USN checkpoint. Handle journal reset, deleted/rotated records, checkpoints older than the journal's first valid USN, volume remount/identity changes, record-version differences, and sequence gaps by marking the index **stale** and doing a safe rebuild/reconciliation. Never continue silently with a supposedly current index.
+- Define a crash-safe protocol: initial enumeration + journal catch-up without losing concurrent changes, generation-tagged snapshots, ordered delta application, durable checkpoint written with the snapshot atomically, recovery after crash/power loss, and a visible freshness state.
+- Volume/device access may require elevated privileges. **Do not require the egui UI to run as administrator.** Design optional least-privilege background service + authenticated local IPC only if justified and reviewed; otherwise fall back to a user-accessible directory scanner. Never elevate silently or disable security controls.
+- Scope this backend to *supported NTFS volumes* after explicit filesystem/capability detection. Do not claim this API path works on exFAT, ReFS, SMB/NAS, Linux, or macOS. Handle unplugged volumes, removable disks, and inaccessible volumes gracefully.
 
-任何“更快”“低内存”声明都必须有可复现数据。分别测量：
-- 冷启动与热启动耗时、二进制体积、空闲内存/CPU。
-- 首次扫描速度（条目数/秒）、索引构建时间、峰值 RSS。
-- 已有索引的精确、子串、模糊查询延迟（例如 p50 / p95）。
-- 结果展示延迟、输入响应、滚动表现与文件变更后的可见性。
-- 不同文件规模、磁盘介质、长路径/Unicode 场景下的差异。
+### 4.2 Portable fallback
 
-构建可重复的临时目录基准数据集，记录 OS、Rust 版本、硬件、构建 profile、文件数量和查询集合。使用 `cargo build --workspace --release --locked` 进行真实体验评估；性能改进要同时考虑最坏情况、正确性与回归风险。避免无界线程池、对每次输入重新全量扫描、每帧克隆完整结果或批量读取文件内容。
+- Retain safe iterative `std::fs` directory traversal, native `PathBuf`s, per-entry error accounting, and cooperative cancellation for other filesystems/platforms or denied NTFS access.
+- Future change monitors may use OS-native facilities, but never assume watchers are lossless; watch overflow, restarts, permission changes, and missing events must trigger reconciliation or rescans.
+- Make symlink/reparse-point following an explicit policy; default to avoiding traversal cycles. Do not unconditionally crawl network mounts, huge volumes, or sensitive directories without user scope/consent.
+- Index only file/directory **names, paths, and necessary metadata by default**; full-text file content indexing is a separate opt-in feature and performance/privacy domain.
 
-## 6. 质量和测试
+### 4.3 Index shape and lifecycle
 
-每次涉及代码的变更至少运行（环境允许时）：
-```sh
+- Preserve native names and paths for matching and OS operations: `OsStr`, `OsString`, `PathBuf`. Keep display strings separate. Avoid `to_string_lossy()` for identity, persistence keys, or destructive actions.
+- Use stable **volume-scoped IDs where available**; account for hard links and renames. Do not assume a path uniquely or permanently identifies a file. Portable scanners may need a different identity strategy.
+- Choose efficient lookup structures based on measured workloads: contiguous entries, directory parent references, exact-name lookup, optional token/n-gram candidate acceleration, and memory-bounded snapshots. Do not assert a trie, database, or mmap is faster without experiments.
+- Track index state (`not indexed / building / current / updating / stale / failed`) and error counts in the UI. Preserve a usable last-known snapshot with a clear stale warning when safe. Keep memory bounded for million-entry directories; batch work and publish snapshots incrementally where semantics permit.
+- If persistence is added, version and validate the format, write atomically, recover from corruption, and guard against cross-version or cross-volume reuse. User-selected roots and filenames can be sensitive; choose a user-appropriate cache location and avoid exporting/indexing extra paths without consent.
+
+## 5. Matching and ranking contract
+
+The existing four modes must keep their behavior unless a change is explicitly requested, tested, and documented:
+
+| Mode | Current rule |
+| --- | --- |
+| `ExactName` | Final native filename equals the query |
+| `ExactPath` | Entire original native path spelling equals the query |
+| `NameSubstring` | Contiguous literal query in native filename |
+| `PathSubstring` | Contiguous literal query in entire native path |
+
+All are currently **case-sensitive**, with **no canonicalization, Unicode normalization, wildcard interpretation, or regular expressions**. Case folding and filesystem case sensitivity are separate issues; Windows vs Unix path separators also need careful treatment.
+
+**Future `Fuzzy` mode** must actually match out-of-order *gaps* (ordered subsequence or an explicitly chosen edit-distance model): e.g. `rptpdf` may rank `report.pdf`, which substring search will not match. Specify candidate selection, Unicode behavior, optional case sensitivity, file-name vs path scope, scoring (contiguous/boundary/basename bonuses), deterministic tie-breaking, and a strict cost/latency budget. Test ranking with Unicode, CJK, accents, non-UTF-8 entries, large candidate sets, and duplicate names. Match against native identity where possible; any textual fuzzy representation must not replace the original operating-system path.
+
+Clearly distinguish **precise/exact**, **literal substring**, **fuzzy**, and **file content** searches. No fake claims of typo tolerance, instant search, or content indexing.
+
+## 6. Concurrency, UI, and platform safety
+
+- Never perform blocking filesystem traversal, OS actions, persistent index I/O, or whole-index sorting inside egui's per-frame `update`. Preserve the existing background worker model while improving it deliberately.
+- Keep input debounce, generation checks, cooperative cancellation, bounded queues/backpressure, and delivery of only current results. Old scan/query events must not overwrite a newer root or query. Repaint on meaningful changes rather than continuously.
+- Keep result virtualization; do not clone an entire million-row list per frame. Account for both **display limits and total index memory**. Maintain predictable selection when results change.
+- Follow system-native open/reveal APIs and robust argument quoting (do not build shell command text). Treat executable names, filenames, paths, and icon loading as untrusted data.
+- Maintain keyboard equivalents, accessibility, scaling, light/dark themes, concise status/progress, and reliable English/Chinese display. Avoid shipping heavyweight font assets without size/license review.
+- Handle I/O failures with context. Avoid routine `unwrap`/`expect`/`panic!`, swallowing read errors, or reporting partial results as complete. Respect privilege boundaries and keep every file action user initiated.
+
+## 7. Quality gates and benchmarking
+
+Run when applicable (the root default command does **not** cover the whole workspace):
+
+```bash
 cargo fmt --all -- --check
 cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --workspace --release --locked
 ```
 
-根默认成员只包含 CLI，质量检查必须显式包含 `--workspace`，覆盖核心、CLI 与桌面。若环境不支持某命令，明确报告**未运行**和原因，不得声称测试通过。保留现有 CLI 行为测试，改变行为时应同步更新文档与用例。三平台 CI 配置与本地 Windows 通过均不能代替远端 Linux / macOS 的实际验证；桌面实际输入、滚动、拖入、字体、高 DPI、打开与定位需区别于后台逻辑测试单独验收。
+The CI workflow defines this matrix for Windows, Linux, and macOS. Configuration is not evidence that all jobs passed. Do not claim commands were run unless they were actually executed; provide failures and limitations. GUI smoke testing must separately exercise drag/drop, fonts, high DPI, sorting, keyboard handling, open/reveal, scan cancellation, and long/network paths. Existing CLI behavior is a compatibility contract: add tests before changing it.
 
-测试重点：
-- 精确文件名与精确完整路径的区别；大小写敏感开关。
-- 子串与非连续 fuzzy 的区别；分数、稳定排序及排名可重复。
-- 空查询、特殊符号、空格、中文、Unicode、极长文件名。
-- 空目录、深层嵌套、权限错误、损坏链接、循环链接、文件扫描期间被删除。
-- 大量同名文件、不同目录、绝对/相对路径、Windows 分隔符和网络路径。
-- 并发取消、快速连续输入、进度更新顺序、旧结果不覆盖新结果。
-- GUI 逻辑与搜索逻辑分层后应可脱离 GUI 进行单元测试。
-- 基准测试不以“本机跑得快”为合并依据，需要与基线比较。
+Required test categories as relevant:
+- Four literal search modes; future fuzzy score/rank determinism; empty/long inputs; CJK, Unicode, invalid UTF-8/UTF-16, spaces and metacharacters.
+- Directory/file/link roots, deep trees, cycles, junctions, concurrent deletions/renames, permission failures and structured partial reports.
+- Background cancellation, generation races, event queue saturation, bounded memory and results, stale-index signaling and snapshot recovery.
+- NTFS (when implemented): initial-enumeration/change race, create/delete/rename/move, FRN reuse, hard links, journal rotation/reset/gap, inaccessible volumes, restart recovery.
+- Platform-specific checks on supported systems. Never treat an untested platform as verified.
 
-## 7. 工作方式（给 Codex）
+**Measure before optimizing.** Record OS, filesystem, medium (SSD/HDD/network), CPU, Rust version, release profile, dataset size, cold/warm cache, and test queries. Compare first scan, index rebuild, live-update lag, p50/p95 query latency, RAM peak/idle, CPU idle, binary size, and perceived UI response. Do not invent performance budgets or benchmark numbers. Benchmark on repeatable fixtures and real large trees; prevent query scans from silently re-reading the disk.
 
-1. 先读取 `README.md`、`Cargo.toml`、相关源文件与现有测试，再说明当前行为和本次改动边界。
-2. 优先做**最小可验证的垂直切片**：例如先抽离匹配核心与测试，再引入 eframe 空壳和后台任务，最后增加索引；不要一次大重写。
-3. 不得在没有明确需求时删除 CLI、重写全部模块、替换现有技术栈，或宣称规划功能已完成。
-4. 修改公共类型、搜索模式、默认值、配置格式或快捷键时，同步更新 README 和对应测试。
-5. 处理实际错误，不要通过大量 `unwrap()`、`expect()`、`panic!()` 或静默丢弃错误蒙混过去。
-6. 不要为了减少代码行数而牺牲可读性；Rust 命名遵循标准惯例，公共接口加必要文档注释。
-7. 控制依赖、构建产物和资源大小；新增大型第三方库前先解释不可替代性。
-8. 完成后汇报改动文件、功能现状、执行过的检查、未验证项、后续风险及性能影响。
-9. 不在未授权的情况下提交密钥、用户本地文件、索引缓存或敏感搜索路径数据。
+## 8. Delivery roadmap
 
-## 8. 分阶段路线图
+This is an incremental plan, not a license for autonomous scope expansion:
 
-- **P0：整理当前原型**：增加匹配语义测试；区分 basename/path；修复非 UTF-8 崩溃及错误处理；明确 CLI 参数和行为。
-- **P1：可用的 egui 桌面 MVP**：加入 eframe、后台扫描、输入防抖、匹配模式切换、结果虚拟列表、文件打开/定位、基础设置。
-- **P2：高性能搜索**：增量内存索引、按需持久化、可取消任务、真实 fuzzy 评分、排序与排除规则、性能基准。
-- **P3：桌面体验完善**：文件变更追踪、稳定重建索引、平台差异适配、键盘无障碍、主题、多语言及发布打包。
+- **Foundation (largely implemented)**: separate core/CLI/desktop workspace; protect legacy CLI behavior; iterative native-path scanning, four literal modes, structured errors and tests. Remaining work: CLI mode/case options and deeper edge-case validation.
+- **Desktop MVP (implemented, needs wider verification)**: egui/eframe UI, debounced asynchronous queries, session scan cache, progress/cancellation, virtualized results, keyboard/platform actions, session settings.
+- **Indexing foundation (next)**: isolate a queryable index from the scan report; define identity, snapshot generation, health/freshness, batch publishing, memory policy, and repeatable baseline benchmarks. Keep generic scanner usable.
+- **Fast Windows NTFS backend**: prototype `FSCTL_ENUM_USN_DATA` enumeration; robust journal checkpoints and `FSCTL_READ_USN_JOURNAL` delta handling, fallbacks and service/access policy; test correctness before optimizing.
+- **True fuzzy search**: explicit algorithm, ranked output, deterministic scores, optional normalization/case policy, benchmarks and UI mode; preserve literal modes.
+- **Portable updates and persistence**: optional watchers with recovery/rescan, versioned crash-safe index cache, settings/exclusion policy and user-visible stale states.
+- **Product hardening**: cross-platform integration tests, accessibility, installer/package/release engineering and measured performance regression gates.
 
-每个阶段必须形成可运行、可测试的增量成果。不要把计划里的 feature 当成已经存在的 API。
+Each milestone must ship a runnable, tested vertical slice and a concise account of what still does not work.
 
-### 2026-10-11 第一轮：workspace 需求完成记录
+## 9. Agent workflow and documentation policy
 
-- 已完成：Cargo workspace 重构；无外部依赖的核心与 `search` CLI 分层；保留原 CLI 参数和默认匹配行为；精确文件名 / 路径及两个子串范围的显式模式；原始路径匹配；迭代扫描；不跟随链接 / Windows reparse point；结构化根错误、子条目部分结果与退出状态；核心及 CLI 基础回归用例；三平台 CI 检查配置。
-- 本地验收：Windows，Rust / Cargo 1.99.0；`cargo fmt --all -- --check`、`cargo test --workspace --all-targets --locked`（23 个核心测试、11 个 CLI 测试）、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`cargo build --workspace --release --locked` 全部通过；根目录 `cargo run --release --locked -- -d ./crates -f search.rs` 已验证默认入口和 release 输出。原型在迁移前的 9 个 CLI 回归测试也已通过。
-- P0 剩余：将搜索模式和大小写策略开放为用户选项，补充对应回归；进一步验证权限、网络路径、长路径及更多平台边界。P0 未全部完结，P1–P3 仍按路线推进。
-- 验证边界：Linux / macOS、Unix 特有的非 UTF-8 文件系统路径与权限测试、真实 Windows 权限拒绝、网络路径及极长磁盘路径尚未验证，远端 CI 尚未运行。本次未引入 GUI、索引、后台任务、fuzzy、排序或筛选规则；扫描仍全量驻留内存，不是文件系统快照，尚无可复现的性能对照数据，不因完成重构宣称更快、低内存或全部平台已通过。
+1. Read `AGENTS.md` and both README files, manifests, affected code, tests, and CI before planning changes; inspect the **latest** branch state.
+2. Write down existing behavior, acceptance criteria, and the smallest necessary files to edit. Prefer a focused slice over a broad redesign.
+3. Preserve public APIs, defaults, executable names, CLI exit semantics, and UI shortcuts unless explicitly tasked otherwise. Add tests for changes in behavior.
+4. Add dependencies or services only when justified by measured need, maintenance/license review, platform support, MSRV, and package footprint. Maintain `Cargo.lock`.
+5. Update `README.md` (English) and `README.zh-CN.md` (Chinese) together for user-visible behavior, supported platforms, command examples, and feature status; keep `AGENTS.md` technical and **English**.
+6. State modified files, observed tests/CI status, unverified platforms, known limitations, and remaining work. No fabricated results or benchmark claims.
+7. Do not commit secrets, local cache/index databases, sensitive filesystem paths, personal files, or generated binaries.
 
-### 2026-10-11 第二轮：桌面 MVP 需求完成记录
+### Historical verification boundary
 
-- 已完成：新增 `fsearch-desktop` workspace 成员与 egui / eframe 桌面入口；四种用户可选匹配模式、扫描范围与拖入、全部 / 文件 / 目录筛选；后台扫描与会话缓存查询、输入防抖、取消、独立 generation、有界事件和虚拟列表；状态 / 进度 / 部分错误反馈；后台系统打开 / 定位、复制路径与键盘 / 鼠标操作；深浅主题、缩放、中英文的会话基础设置。
-- 核心增量：`scan_path_with` / `ScanProgress` / `ScanOutcome` 增加与 GUI 无关的进度和协作取消，单候选 `matches_path` 公开；原 CLI 参数、默认完整路径子串及输出 / 退出规则保留。根默认启动仍为 CLI，桌面通过 `-p fsearch-desktop` 选择。
-- 本地验收：Windows、Rust / Cargo 1.99.0；fmt、全 workspace / all-targets 测试（29 个核心、22 个桌面逻辑 / worker / 平台、11 个 CLI，共 62 个）、Clippy `-D warnings`、全 workspace release 构建及 `git diff --check` 均通过。已实际启动最终 release 程序并验证 `--directory .\crates --query search --mode name-substring`，得到 4 个匹配 / 21 个已扫描条目。当前 Windows EXE 为 6,435,328 字节，属于本机构建产物，不是性能对照结论。
-- 桌面检查：真实窗口验证首次绘制、中文 / English、深浅主题、缩放、查询防抖、名称 / 路径范围差别、精确路径、目录筛选、方向键选择、Enter 通过 Notepad 打开、Ctrl+Shift+C 复制并粘贴包含中文 / 空格 / 逗号的路径、Ctrl+O 通过 Explorer 定位并选中条目。结果接收与防抖提交放在 `App::logic`，隐藏窗口仍可排空后台有界通道；此回调不绘制 UI 或执行文件 I/O。
-- 阶段边界：P1 的桌面 MVP 切片已实现，基础设置不持久化；P0 的 CLI 模式 / 大小写选项和更多平台边界仍待完成。会话缓存不等于持久化或增量索引，取消 / 原始路径排序 / 双语只覆盖当前实现；P2 / P3 的 fuzzy、数据库索引、监听、排除规则、流式大目录索引、性能基准及发布打包继续待推进。
-- 验证边界：Linux / macOS 构建与桌面运行、Unix 专有路径 / 权限用例、真实拖入、Windows 权限拒绝、网络 / 极长磁盘路径和大规模目录性能尚未验证。当前扫描仍全量驻留内存，元数据检查与目录打开不构成原子 no-follow 保证；Linux 定位为父目录，Windows 定位有 API 长度限制。远端三平台 CI 尚未运行，不宣称全部目标平台已验收或具备未经测量的性能收益。
+The previous repository guide records a Windows local development pass on 2026-10-11 using Rust/Cargo 1.99: 62 total tests (29 core, 22 desktop and 11 CLI), fmt, Clippy, release build, and selected GUI interactions. **This is historical project documentation, not a new validation of the current head or of Linux/macOS.** Re-run checks after code changes and verify CI independently.
 
-## 9. 文档维护
+## 10. License and releases
 
-README 是面向使用者的真实功能说明；AGENTS 是面向开发者和代理的规范。新功能上线后，应把 README 中对应项目从“计划”移到“已实现”，补充使用示例与限制。不要添加未经测量的性能数字、未经验证的平台支持声明或不存在的下载链接。
+No license file is present in the inspected repository snapshot. Do not assert a project license or publish a release with assumptions about redistribution rights. Select and add a license deliberately before advertising an open-source distribution.
