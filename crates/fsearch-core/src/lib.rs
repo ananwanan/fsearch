@@ -6,5 +6,7 @@
 pub mod scanner;
 pub mod search;
 
-pub use scanner::{scan_path, ScanIssue, ScanOperation, ScanReport};
+pub use scanner::{
+    scan_path, scan_path_with, ScanIssue, ScanOperation, ScanOutcome, ScanProgress, ScanReport,
+};
 pub use search::{find_paths, SearchMode};

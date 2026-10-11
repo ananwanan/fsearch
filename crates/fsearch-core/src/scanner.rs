@@ -15,6 +15,24 @@ pub struct ScanReport {
     pub issues: Vec<ScanIssue>,
 }
 
+/// Counts of paths and recoverable failures observed so far.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ScanProgress {
+    /// Number of observed candidate paths.
+    pub entries: usize,
+    /// Number of recoverable child-entry failures.
+    pub issues: usize,
+}
+
+/// A complete or explicitly cancelled scan, including its observed partial data.
+#[derive(Debug, Default)]
+pub struct ScanOutcome {
+    /// Paths and recoverable failures observed before completion or cancellation.
+    pub report: ScanReport,
+    /// Whether the observer stopped this scan before it was reported complete.
+    pub cancelled: bool,
+}
+
 /// The file-system operation that failed while scanning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanOperation {
@@ -84,6 +102,32 @@ impl Error for ScanIssue {
 /// disappears before its metadata is read. The report is not a file-system
 /// snapshot, and all paths are retained in memory.
 pub fn scan_path(root: impl AsRef<Path>) -> Result<ScanReport, ScanIssue> {
+    scan_path_with(root, |_| true).map(|outcome| outcome.report)
+}
+
+/// Scan with progress reporting and cooperative cancellation.
+///
+/// The observer runs synchronously on the scanning thread. Returning `true`
+/// continues scanning; `false` returns the observed partial report with
+/// [`ScanOutcome::cancelled`] set. The initial callback occurs before any I/O,
+/// so initial cancellation takes precedence over an invalid root. Later checks
+/// occur before directory opens and entry reads, and whenever a path or issue is
+/// recorded. Counts are monotonic, but a cancellation check may repeat them.
+///
+/// Root failures still return `Err`; progress counts only recoverable child
+/// failures. Filesystem operations already in progress cannot be interrupted.
+/// Root interpretation, native paths, and link behavior match [`scan_path`].
+pub fn scan_path_with(
+    root: impl AsRef<Path>,
+    mut observer: impl FnMut(ScanProgress) -> bool,
+) -> Result<ScanOutcome, ScanIssue> {
+    let mut report = ScanReport::default();
+    if !notify_progress(&report, &mut observer) {
+        return Ok(ScanOutcome {
+            report,
+            cancelled: true,
+        });
+    }
     let root = root.as_ref();
     // Validate the caller's spelling using the OS's path rules first.
     let metadata = fs::symlink_metadata(root).map_err(|error| ScanIssue {
@@ -106,9 +150,15 @@ pub fn scan_path(root: impl AsRef<Path>) -> Result<ScanReport, ScanIssue> {
     };
 
     if !is_traversable_directory(&metadata) {
-        return Ok(ScanReport {
-            paths: vec![root.to_path_buf()],
-            issues: Vec::new(),
+        report.paths.push(root.to_path_buf());
+        let cancelled = !notify_progress(&report, &mut observer);
+        return Ok(ScanOutcome { report, cancelled });
+    }
+
+    if !notify_progress(&report, &mut observer) {
+        return Ok(ScanOutcome {
+            report,
+            cancelled: true,
         });
     }
 
@@ -117,16 +167,38 @@ pub fn scan_path(root: impl AsRef<Path>) -> Result<ScanReport, ScanIssue> {
         operation: ScanOperation::ReadDirectory,
         error,
     })?;
-    let mut report = ScanReport::default();
     let mut pending_directories = Vec::new();
-    record_entries(root, entries, &mut report, &mut pending_directories);
-    scan_pending_directories(&mut report, &mut pending_directories);
+    let completed =
+        record_entries_with(
+            root,
+            entries,
+            &mut report,
+            &mut pending_directories,
+            &mut observer,
+        ) && scan_pending_directories_with(&mut report, &mut pending_directories, &mut observer);
 
-    Ok(report)
+    Ok(ScanOutcome {
+        report,
+        cancelled: !completed,
+    })
 }
 
-fn scan_pending_directories(report: &mut ScanReport, pending_directories: &mut Vec<PathBuf>) {
+fn notify_progress(report: &ScanReport, observer: &mut impl FnMut(ScanProgress) -> bool) -> bool {
+    observer(ScanProgress {
+        entries: report.paths.len(),
+        issues: report.issues.len(),
+    })
+}
+
+fn scan_pending_directories_with(
+    report: &mut ScanReport,
+    pending_directories: &mut Vec<PathBuf>,
+    observer: &mut impl FnMut(ScanProgress) -> bool,
+) -> bool {
     while let Some(directory) = pending_directories.pop() {
+        if !notify_progress(report, observer) {
+            return false;
+        }
         // A queued directory can disappear or become a link while other entries
         // are scanned. Recheck before opening it; path-based std operations still
         // do not provide an atomic file-system snapshot.
@@ -139,29 +211,51 @@ fn scan_pending_directories(report: &mut ScanReport, pending_directories: &mut V
                     operation: ScanOperation::ReadMetadata,
                     error,
                 });
+                if !notify_progress(report, observer) {
+                    return false;
+                }
                 continue;
             }
         }
+        if !notify_progress(report, observer) {
+            return false;
+        }
         match fs::read_dir(&directory) {
             Ok(entries) => {
-                record_entries(&directory, entries, report, pending_directories);
+                if !record_entries_with(&directory, entries, report, pending_directories, observer)
+                {
+                    return false;
+                }
             }
-            Err(error) => report.issues.push(ScanIssue {
-                path: directory,
-                operation: ScanOperation::ReadDirectory,
-                error,
-            }),
+            Err(error) => {
+                report.issues.push(ScanIssue {
+                    path: directory,
+                    operation: ScanOperation::ReadDirectory,
+                    error,
+                });
+                if !notify_progress(report, observer) {
+                    return false;
+                }
+            }
         }
     }
+    true
 }
 
-fn record_entries(
+fn record_entries_with(
     directory: &Path,
-    entries: impl Iterator<Item = io::Result<DirEntry>>,
+    mut entries: impl Iterator<Item = io::Result<DirEntry>>,
     report: &mut ScanReport,
     pending_directories: &mut Vec<PathBuf>,
-) {
-    for entry in entries {
+    observer: &mut impl FnMut(ScanProgress) -> bool,
+) -> bool {
+    loop {
+        if !notify_progress(report, observer) {
+            return false;
+        }
+        let Some(entry) = entries.next() else {
+            return true;
+        };
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -170,24 +264,52 @@ fn record_entries(
                     operation: ScanOperation::ReadEntry,
                     error,
                 });
+                if !notify_progress(report, observer) {
+                    return false;
+                }
                 continue;
             }
         };
         let path = entry.path();
         report.paths.push(path.clone());
+        if !notify_progress(report, observer) {
+            return false;
+        }
 
         match fs::symlink_metadata(&path) {
             Ok(metadata) if is_traversable_directory(&metadata) => {
                 pending_directories.push(path);
             }
             Ok(_) => {}
-            Err(error) => report.issues.push(ScanIssue {
-                path,
-                operation: ScanOperation::ReadMetadata,
-                error,
-            }),
+            Err(error) => {
+                report.issues.push(ScanIssue {
+                    path,
+                    operation: ScanOperation::ReadMetadata,
+                    error,
+                });
+                if !notify_progress(report, observer) {
+                    return false;
+                }
+            }
         }
     }
+}
+
+#[cfg(test)]
+fn scan_pending_directories(report: &mut ScanReport, pending_directories: &mut Vec<PathBuf>) {
+    scan_pending_directories_with(report, pending_directories, &mut |_| true);
+}
+
+#[cfg(test)]
+fn record_entries(
+    directory: &Path,
+    entries: impl Iterator<Item = io::Result<DirEntry>>,
+    report: &mut ScanReport,
+    pending_directories: &mut Vec<PathBuf>,
+) {
+    record_entries_with(directory, entries, report, pending_directories, &mut |_| {
+        true
+    });
 }
 
 fn is_traversable_directory(metadata: &Metadata) -> bool {
@@ -261,6 +383,155 @@ mod tests {
         let mut spelling = path.as_os_str().to_os_string();
         spelling.push(std::path::MAIN_SEPARATOR_STR);
         PathBuf::from(spelling)
+    }
+
+    fn assert_monotonic_progress(progress: &[ScanProgress]) {
+        assert_eq!(progress.first(), Some(&ScanProgress::default()));
+        assert!(progress.windows(2).all(|pair| {
+            pair[0].entries <= pair[1].entries && pair[0].issues <= pair[1].issues
+        }));
+    }
+
+    #[test]
+    fn initial_cancellation_precedes_root_io() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new()?;
+        let missing = directory.path().join("missing");
+        let mut progress = Vec::new();
+        let outcome = scan_path_with(&missing, |counts| {
+            progress.push(counts);
+            false
+        })?;
+        assert!(outcome.cancelled);
+        assert!(outcome.report.paths.is_empty());
+        assert!(outcome.report.issues.is_empty());
+        assert_eq!(progress, vec![ScanProgress::default()]);
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_before_root_directory_open_returns_no_candidates() -> Result<(), Box<dyn Error>>
+    {
+        let directory = TestDirectory::new()?;
+        fs::write(directory.path().join("not-observed.txt"), [])?;
+        let mut checks = 0;
+        let outcome = scan_path_with(directory.path(), |_| {
+            checks += 1;
+            checks == 1
+        })?;
+        assert!(outcome.cancelled);
+        assert!(outcome.report.paths.is_empty());
+        assert!(outcome.report.issues.is_empty());
+        assert_eq!(checks, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn nested_scan_cancellation_preserves_partial_paths_and_monotonic_progress(
+    ) -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new()?;
+        let child = directory.path().join("level");
+        let nested = child.join("nested");
+        fs::create_dir_all(&nested)?;
+        fs::write(nested.join("not-observed.txt"), [])?;
+        let mut progress = Vec::new();
+        let outcome = scan_path_with(directory.path(), |counts| {
+            progress.push(counts);
+            counts.entries < 2
+        })?;
+        assert!(outcome.cancelled);
+        assert_eq!(outcome.report.paths, vec![child, nested]);
+        assert!(outcome.report.issues.is_empty());
+        assert_monotonic_progress(&progress);
+        assert_eq!(
+            progress.last(),
+            Some(&ScanProgress {
+                entries: 2,
+                issues: 0
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completed_observed_scan_matches_the_compatibility_api() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new()?;
+        fs::create_dir(directory.path().join("child"))?;
+        fs::write(directory.path().join("file.txt"), [])?;
+        let baseline = scan_path(directory.path())?;
+        let mut progress = Vec::new();
+        let outcome = scan_path_with(directory.path(), |counts| {
+            progress.push(counts);
+            true
+        })?;
+        assert!(!outcome.cancelled);
+        assert_eq!(
+            baseline.paths.into_iter().collect::<HashSet<_>>(),
+            outcome.report.paths.into_iter().collect::<HashSet<_>>()
+        );
+        assert!(baseline.issues.is_empty());
+        assert!(outcome.report.issues.is_empty());
+        assert_monotonic_progress(&progress);
+        assert_eq!(
+            progress.last(),
+            Some(&ScanProgress {
+                entries: 2,
+                issues: 0
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recoverable_error_progress_is_reported_and_can_cancel() -> Result<(), Box<dyn Error>> {
+        for cancel_on_issue in [false, true] {
+            let directory = TestDirectory::new()?;
+            let file = directory.path().join("removed.txt");
+            fs::write(&file, [])?;
+            let mut progress = Vec::new();
+            let mut removal = None;
+            let outcome = scan_path_with(directory.path(), |counts| {
+                progress.push(counts);
+                if counts.entries == 1 && removal.is_none() {
+                    removal = Some(fs::remove_file(&file));
+                }
+                !cancel_on_issue || counts.issues == 0
+            })?;
+            removal.ok_or_else(|| io::Error::other("expected entry callback"))??;
+            assert_eq!(outcome.cancelled, cancel_on_issue);
+            assert_eq!(outcome.report.paths, vec![file.clone()]);
+            assert_eq!(outcome.report.issues.len(), 1);
+            assert_eq!(outcome.report.issues[0].path, file);
+            assert_eq!(
+                outcome.report.issues[0].operation,
+                ScanOperation::ReadMetadata
+            );
+            assert_monotonic_progress(&progress);
+            assert_eq!(
+                progress.last(),
+                Some(&ScanProgress {
+                    entries: 1,
+                    issues: 1
+                })
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn observed_root_failure_still_returns_the_original_error() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new()?;
+        let missing = directory.path().join("missing");
+        let mut progress = Vec::new();
+        let issue = scan_path_with(&missing, |counts| {
+            progress.push(counts);
+            true
+        })
+        .unwrap_err();
+        assert_eq!(issue.path, missing);
+        assert_eq!(issue.operation, ScanOperation::ReadMetadata);
+        assert_eq!(issue.error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(progress, vec![ScanProgress::default()]);
+        Ok(())
     }
 
     #[test]

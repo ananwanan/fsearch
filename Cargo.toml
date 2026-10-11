@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/fsearch-core", "crates/fsearch-cli"]
+members = ["crates/fsearch-core", "crates/fsearch-cli", "crates/fsearch-desktop"]
 default-members = ["crates/fsearch-cli"]
 resolver = "2"
 
@@ -10,6 +10,7 @@ edition = "2021"
 [workspace.dependencies]
 fsearch-core = { path = "crates/fsearch-core" }
 clap = { version = "4.5.26", features = ["derive"] }
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 
 [profile.release]
 debug = false

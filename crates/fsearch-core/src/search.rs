@@ -27,7 +27,8 @@ pub fn find_paths<'a>(paths: &'a [PathBuf], query: &OsStr, mode: SearchMode) -> 
         .collect()
 }
 
-fn matches_path(path: &Path, query: &OsStr, mode: SearchMode) -> bool {
+/// Match one native path without allocating a result vector or touching disk.
+pub fn matches_path(path: &Path, query: &OsStr, mode: SearchMode) -> bool {
     match mode {
         SearchMode::ExactName => path.file_name() == Some(query),
         SearchMode::ExactPath => path.as_os_str() == query,

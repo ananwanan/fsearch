@@ -1,0 +1,11 @@
+[package]
+name = "fsearch-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.95"
+description = "FSearch egui desktop application"
+
+[dependencies]
+clap.workspace = true
+eframe.workspace = true
+fsearch-core.workspace = true

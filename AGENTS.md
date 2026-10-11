@@ -19,18 +19,26 @@ FSearch 是基于 Rust 的轻量、高性能、跨平台桌面文件搜索工具
 
 ## 2. 当前仓库事实（更新于 2026-10-11）
 
-当前为 Rust 2021 的 CLI 原型，不是已完成的 egui 桌面软件：
-- 根 `Cargo.toml` 为虚拟 workspace，resolver `2`；成员是 `crates/fsearch-core` 与 `crates/fsearch-cli`，默认成员为 CLI。共享 version、Rust edition 2021 和 `clap` 依赖约束，保留根 `Cargo.lock` 和 release profile。
+当前为 Rust 2021 workspace，包含可用的 egui 桌面 MVP 和保留的 CLI 原型；持久化索引、真正 fuzzy 和文件监听尚未实现：
+
+- 根 `Cargo.toml` 为虚拟 workspace，resolver `2`；成员是 `crates/fsearch-core`、`crates/fsearch-cli` 与 `crates/fsearch-desktop`，默认成员为 CLI。共享 version、Rust edition 2021 与 `clap` / `eframe` 依赖约束，保留根 `Cargo.lock` 和 release profile。
 - `crates/fsearch-core/src/lib.rs`：公开与 CLI / GUI 无关的扫描和匹配接口；核心无外部依赖。
-- `crates/fsearch-core/src/search.rs`：`SearchMode::{ExactName, ExactPath, NameSubstring, PathSubstring}` 与 `find_paths`，使用原始 `OsStr` 进行区分大小写的字面匹配，不进行规范化或 fuzzy 评分。
-- `crates/fsearch-core/src/scanner.rs`：`scan_path` 迭代扫描，保留原始 `PathBuf`；`ScanReport` 返回路径与子条目问题，`ScanIssue` 保留路径、操作和原始 I/O 错误。
+- `crates/fsearch-core/src/search.rs`：`SearchMode::{ExactName, ExactPath, NameSubstring, PathSubstring}`、`find_paths` 与公开的单候选 `matches_path`，使用原始 `OsStr` 进行区分大小写的字面匹配，不进行规范化或 fuzzy 评分。
+- `crates/fsearch-core/src/scanner.rs`：`scan_path` 迭代扫描，保留原始 `PathBuf`；`ScanReport` 返回路径与子条目问题，`ScanIssue` 保留路径、操作和原始 I/O 错误。新增 `scan_path_with`、`ScanProgress`、`ScanOutcome`，支持回调进度与协作取消；原 `scan_path` 兼容保留。
 - `crates/fsearch-cli/src/main.rs` 与 `args.rs`：CLI 包名 / binary 名保持 `search`，两个原有必填参数 `--directory` / `-d` 和 `--filename` / `-f` 保留，默认搜索完整路径连续子串。
 - `crates/fsearch-cli/tests/cli.rs` 与核心单元测试：CLI 行为、匹配语义及扫描边界回归。
+- `crates/fsearch-desktop/src/main.rs` / `app.rs`：包与 binary 为 `fsearch-desktop`，通过 eframe 启动桌面界面；包含四种模式、范围、类型筛选、虚拟列表、状态、键盘操作、主题 / 缩放 / 中英文等会话设置。
+- `crates/fsearch-desktop/src/worker.rs`：单后台扫描 / 查询线程、175 ms 输入防抖配合、独立扫描 / 查询 generation、取消与会话内存缓存；后台生成元数据 / 展示文本并按原始路径排序，`Arc` 快照和 8 项有界事件通道，进度约 100 ms 更新，最多发布 20,000 个结果索引并保留全命中统计。
+- `crates/fsearch-desktop/src/platform.rs`：独立有界后台 action worker，Windows ShellExecuteW / PIDL 定位、macOS `open` / `open -R`、Linux `xdg-open`；启动阶段读取可选本机 CJK 字体。
 - `.github/workflows/rust.yml`：配置 Windows / Linux / macOS 的 fmt、workspace test、Clippy 和 release build；远端执行结果需另行验证。
 
 务必注意：CLI 固定为 `PathSubstring`，`--filename` 是历史参数名，不表示仅匹配 basename。相对扫描根保留相对路径，目录根本身不入结果，文件 / 链接根作为单条候选；空子串查询匹配全部候选。扫描默认不跟随符号链接或 Windows reparse point（包括 junction），不提供可选跟随策略。根错误报告 `Scan failed` 并退出 `1`；子条目错误报告 `Scan incomplete`，继续输出部分匹配并退出 `1`；合法空目录和无匹配退出 `0`，参数错误由 clap 退出 `2`。结果保留输入序列，无全局排序保证。CLI 仍以 `dbg!` 向 stderr 输出，debug 构建在有匹配时向 stdout 输出耗时，合法空目录保留 `File list not found`。
 
-核心已区分文件名 / 完整路径精确匹配和两种子串范围，但尚未提供用户可选的 CLI 搜索模式、大小写开关、字符序列模糊匹配、持久化索引、GUI、后台任务、过滤设置或文件监视。不要在 README、发布说明、UI 或测试中误称这些能力已经上线。
+桌面通过 `cargo run -p fsearch-desktop --release --locked` 启动。可选参数为 `--directory` / `-d`、`--query` / `-q`、`--mode`（`exact-name`、`exact-path`、`name-substring`、`path-substring`，默认文件名子串）；指定根时自动扫描，不指定时只预填工作目录，等用户粘贴 / 拖入路径后扫描。未加入原生路径选择器。扫描完成后发布缓存，后续查询复用该缓存，不因输入重新扫描。
+
+桌面类型筛选为全部 / 仅文件 / 仅目录，链接和其他条目只在“全部”中显示。快捷键为 Ctrl+L 聚焦查询、方向键选择、Enter 打开、Ctrl+Shift+C 复制路径、Ctrl+O 定位、Ctrl+R 重扫、Escape 取消任务（空闲时清空查询），提供双击及鼠标按钮。中文 / English、深色 / 浅色、缩放仅当前会话生效；无 CJK 字体时默认 English 并禁用中文。长路径显示截断，hover 展示全文；非 UTF-8 展示与文本复制可能有损，打开和匹配保持原始路径。
+
+Windows 定位使用完整项 PIDL 打开父目录并选中条目，API 路径长度最多 259 个 UTF-16 单元；Linux 定位仅打开父目录，不保证选中条目。核心与 CLI 保持原扫描次序，桌面按原始路径稳定排序。未提供 CLI 模式选择、可选大小写策略、fuzzy、持久化 / 增量索引、流式大目录索引、设置持久化、排除目录规则或文件监视。不要在 README、发布说明、UI 或测试中误称这些能力已经上线。
 
 ## 3. 技术选型
 
@@ -42,11 +50,13 @@ FSearch 是基于 Rust 的轻量、高性能、跨平台桌面文件搜索工具
 - 索引持久化：只有明确数据模型、崩溃恢复与迁移方案后才引入数据库或序列化格式。
 - 配置和日志：保持依赖精简，不加入未使用的基础设施。
 
+当前桌面新增的直接外部依赖仅为既定 GUI 框架 [`eframe 0.36.2`](https://docs.rs/eframe/0.36.2/eframe/)（MIT OR Apache-2.0），通过其 re-export 使用 egui；该框架承担原生窗口、渲染和平台输入，不引入第二套 GUI。桌面成员 MSRV 为 Rust 1.95，本次开发工具链为 1.99。`default-features = false`，启用 `accesskit` / `default_fonts` / `glow` / `wayland` / `x11`，只用 Glow / OpenGL 后端，不启用 WGPU。锁文件可能列出未启用的可选 / 平台依赖，判断构建内容应以实际 `cargo tree -p fsearch-desktop` 为准；框架传递依赖与体积、资源开销需实际测量，不能以“只加一个直接依赖”推断包体很小。
+
 **不要为了追求最新版本盲目添加依赖**；新增依赖需检查维护状态、许可证、跨平台支持、构建体积和供应链风险。保留并更新 `Cargo.lock`（应用项目）。
 
 ## 4. workspace 架构与演进方向
 
-当前已将搜索核心与 CLI 分为独立 crate：
+当前搜索核心、CLI 与桌面分别为独立 crate：
 
 ```text
 Cargo.toml                         # 虚拟 workspace、共享依赖 / edition / profile
@@ -60,15 +70,23 @@ crates/
     src/main.rs                    # search 可执行文件入口
     src/args.rs                    # CLI 参数
     tests/cli.rs                   # CLI 回归测试
+  fsearch-desktop/
+    src/main.rs                    # eframe 启动与初始参数
+    src/app.rs                     # 应用状态、视图与会话设置
+    src/model.rs                   # generation 校验、取消状态与结果选择
+    src/worker.rs                  # 后台扫描 / 缓存 / 查询与取消
+    src/platform.rs                # 后台文件操作与启动字体加载
 ```
 
-未来 egui / eframe 桌面入口可新增 workspace 成员，负责应用状态、事件和视图；索引、平台操作、配置、基准等模块按实际需求建立，不提前创建空目录。保留 CLI 作为调试 / 回归工具；搜索核心不应依赖 `egui` / `eframe` / CLI 参数类型。优先使用清晰的数据模型和稳定的模块边界，避免过度抽象或微服务式拆分。
+桌面入口负责应用状态、事件和视图，扫描 / 查询耗时工作与系统文件操作分别在后台运行；索引持久化、配置持久化、基准等模块按实际需求建立，不提前创建空目录。保留 CLI 作为调试 / 回归工具；搜索核心不应依赖 `egui` / `eframe` / CLI 参数类型。优先使用清晰的数据模型和稳定的模块边界，避免过度抽象或微服务式拆分。
 
 ### 4.1 数据模型
 
 建议建立类似 `SearchQuery`、`SearchMode`、`SearchOptions`、`SearchResult`、`FileEntry` 的显式类型：
+
 - 当前 `SearchMode` 已区分 `ExactName`、`ExactPath`、`NameSubstring`、`PathSubstring`；未来增加 `Fuzzy` 时必须实现真正的非连续匹配及评分，不能把子串模式改名冒充模糊匹配。
 - 当前扫描模型为 `ScanReport { paths, issues }`，问题模型为 `ScanIssue { path, operation, error }`；根错误与子条目部分失败分别处理，不能用空结果掩盖失败。
+- `scan_path_with` 的同步进度回调在扫描线程运行，返回 `false` 时得到 `ScanOutcome { report, cancelled }`；已观察的部分报告保留，正在执行的系统 I/O 不能强行中断，GUI 不得在帧内调用该扫描接口。
 - 保存系统原始路径（`PathBuf` / `OsString`）；不要把 `to_string_lossy()` 生成的展示字符串作为文件系统真值。
 - 文件和目录标志、大小、时间、搜索分数等元数据按需延迟读取。
 - 结果 ID 与扫描/索引世代（generation）可用于防止旧任务覆盖新结果。
@@ -130,7 +148,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --workspace --release --locked
 ```
 
-根默认成员只包含 CLI，质量检查必须显式包含 `--workspace`，避免漏测核心。若环境不支持某命令，明确报告**未运行**和原因，不得声称测试通过。保留现有 CLI 行为测试，改变行为时应同步更新文档与用例。三平台 CI 配置与本地 Windows 通过均不能代替远端 Linux / macOS 的实际验证。
+根默认成员只包含 CLI，质量检查必须显式包含 `--workspace`，覆盖核心、CLI 与桌面。若环境不支持某命令，明确报告**未运行**和原因，不得声称测试通过。保留现有 CLI 行为测试，改变行为时应同步更新文档与用例。三平台 CI 配置与本地 Windows 通过均不能代替远端 Linux / macOS 的实际验证；桌面实际输入、滚动、拖入、字体、高 DPI、打开与定位需区别于后台逻辑测试单独验收。
 
 测试重点：
 - 精确文件名与精确完整路径的区别；大小写敏感开关。
@@ -163,12 +181,21 @@ cargo build --workspace --release --locked
 
 每个阶段必须形成可运行、可测试的增量成果。不要把计划里的 feature 当成已经存在的 API。
 
-### 2026-10-11 需求完成记录
+### 2026-10-11 第一轮：workspace 需求完成记录
 
 - 已完成：Cargo workspace 重构；无外部依赖的核心与 `search` CLI 分层；保留原 CLI 参数和默认匹配行为；精确文件名 / 路径及两个子串范围的显式模式；原始路径匹配；迭代扫描；不跟随链接 / Windows reparse point；结构化根错误、子条目部分结果与退出状态；核心及 CLI 基础回归用例；三平台 CI 检查配置。
 - 本地验收：Windows，Rust / Cargo 1.99.0；`cargo fmt --all -- --check`、`cargo test --workspace --all-targets --locked`（23 个核心测试、11 个 CLI 测试）、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`cargo build --workspace --release --locked` 全部通过；根目录 `cargo run --release --locked -- -d ./crates -f search.rs` 已验证默认入口和 release 输出。原型在迁移前的 9 个 CLI 回归测试也已通过。
 - P0 剩余：将搜索模式和大小写策略开放为用户选项，补充对应回归；进一步验证权限、网络路径、长路径及更多平台边界。P0 未全部完结，P1–P3 仍按路线推进。
 - 验证边界：Linux / macOS、Unix 特有的非 UTF-8 文件系统路径与权限测试、真实 Windows 权限拒绝、网络路径及极长磁盘路径尚未验证，远端 CI 尚未运行。本次未引入 GUI、索引、后台任务、fuzzy、排序或筛选规则；扫描仍全量驻留内存，不是文件系统快照，尚无可复现的性能对照数据，不因完成重构宣称更快、低内存或全部平台已通过。
+
+### 2026-10-11 第二轮：桌面 MVP 需求完成记录
+
+- 已完成：新增 `fsearch-desktop` workspace 成员与 egui / eframe 桌面入口；四种用户可选匹配模式、扫描范围与拖入、全部 / 文件 / 目录筛选；后台扫描与会话缓存查询、输入防抖、取消、独立 generation、有界事件和虚拟列表；状态 / 进度 / 部分错误反馈；后台系统打开 / 定位、复制路径与键盘 / 鼠标操作；深浅主题、缩放、中英文的会话基础设置。
+- 核心增量：`scan_path_with` / `ScanProgress` / `ScanOutcome` 增加与 GUI 无关的进度和协作取消，单候选 `matches_path` 公开；原 CLI 参数、默认完整路径子串及输出 / 退出规则保留。根默认启动仍为 CLI，桌面通过 `-p fsearch-desktop` 选择。
+- 本地验收：Windows、Rust / Cargo 1.99.0；fmt、全 workspace / all-targets 测试（29 个核心、22 个桌面逻辑 / worker / 平台、11 个 CLI，共 62 个）、Clippy `-D warnings`、全 workspace release 构建及 `git diff --check` 均通过。已实际启动最终 release 程序并验证 `--directory .\crates --query search --mode name-substring`，得到 4 个匹配 / 21 个已扫描条目。当前 Windows EXE 为 6,435,328 字节，属于本机构建产物，不是性能对照结论。
+- 桌面检查：真实窗口验证首次绘制、中文 / English、深浅主题、缩放、查询防抖、名称 / 路径范围差别、精确路径、目录筛选、方向键选择、Enter 通过 Notepad 打开、Ctrl+Shift+C 复制并粘贴包含中文 / 空格 / 逗号的路径、Ctrl+O 通过 Explorer 定位并选中条目。结果接收与防抖提交放在 `App::logic`，隐藏窗口仍可排空后台有界通道；此回调不绘制 UI 或执行文件 I/O。
+- 阶段边界：P1 的桌面 MVP 切片已实现，基础设置不持久化；P0 的 CLI 模式 / 大小写选项和更多平台边界仍待完成。会话缓存不等于持久化或增量索引，取消 / 原始路径排序 / 双语只覆盖当前实现；P2 / P3 的 fuzzy、数据库索引、监听、排除规则、流式大目录索引、性能基准及发布打包继续待推进。
+- 验证边界：Linux / macOS 构建与桌面运行、Unix 专有路径 / 权限用例、真实拖入、Windows 权限拒绝、网络 / 极长磁盘路径和大规模目录性能尚未验证。当前扫描仍全量驻留内存，元数据检查与目录打开不构成原子 no-follow 保证；Linux 定位为父目录，Windows 定位有 API 长度限制。远端三平台 CI 尚未运行，不宣称全部目标平台已验收或具备未经测量的性能收益。
 
 ## 9. 文档维护
 
