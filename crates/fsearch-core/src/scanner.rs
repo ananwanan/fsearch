@@ -578,15 +578,29 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn file_root_with_directory_suffix_preserves_the_windows_path() -> Result<(), Box<dyn Error>> {
+    fn file_root_with_directory_suffix_obeys_native_windows_rules() -> Result<(), Box<dyn Error>> {
         let directory = TestDirectory::new()?;
         let file = directory.path().join("report.txt");
         fs::write(&file, [])?;
         for input in [with_trailing_separator(&file), file.join(".")] {
-            let report = scan_path(&input)?;
-            assert_eq!(report.paths.len(), 1);
-            assert_eq!(report.paths[0].as_os_str(), input.as_os_str());
-            assert!(report.issues.is_empty());
+            // Native Windows APIs can accept or reject these spellings. Scanning
+            // must preserve the OS result rather than normalize an invalid root.
+            match fs::symlink_metadata(&input) {
+                Ok(metadata) => {
+                    assert!(metadata.is_file());
+                    let report = scan_path(&input)?;
+                    assert_eq!(report.paths.len(), 1);
+                    assert_eq!(report.paths[0].as_os_str(), input.as_os_str());
+                    assert!(report.issues.is_empty());
+                }
+                Err(error) => {
+                    let issue = scan_path(&input).unwrap_err();
+                    assert_eq!(issue.path.as_os_str(), input.as_os_str());
+                    assert_eq!(issue.operation, ScanOperation::ReadMetadata);
+                    assert_eq!(issue.error.kind(), error.kind());
+                    assert_eq!(issue.error.raw_os_error(), error.raw_os_error());
+                }
+            }
         }
         Ok(())
     }
@@ -805,7 +819,26 @@ mod tests {
         let file = directory
             .path()
             .join(OsString::from_vec(b"native-\xff.txt".to_vec()));
-        fs::write(&file, [])?;
+        match fs::write(&file, []) {
+            Ok(()) => {}
+            #[cfg(target_os = "macos")]
+            Err(error) if error.raw_os_error() == Some(92) => {
+                // Darwin EILSEQ (92): filesystems such as APFS reject this name.
+                // Still check that an unsupported root preserves the native error.
+                let native_error = fs::symlink_metadata(&file).unwrap_err();
+                let issue = scan_path(&file).unwrap_err();
+                assert_eq!(issue.path.as_os_str(), file.as_os_str());
+                assert_eq!(issue.operation, ScanOperation::ReadMetadata);
+                assert_eq!(issue.error.kind(), native_error.kind());
+                assert_eq!(issue.error.raw_os_error(), native_error.raw_os_error());
+                eprintln!(
+                    "non-UTF-8 scan fixture unsupported by this filesystem: {error}; \
+                     verified the native root error instead"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        }
         let report = scan_path(directory.path())?;
         assert_eq!(report.paths, vec![file]);
         assert!(report.paths[0].to_str().is_none());
