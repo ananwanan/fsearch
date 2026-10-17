@@ -4,7 +4,7 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [Development guide](AGENTS.md)
 
-> **Status: early desktop MVP, not an Everything-equivalent indexer yet.** FSearch currently provides an egui desktop interface, asynchronous directory scanning and searching against an in-memory **session snapshot**, plus a compatible CLI. Persistent indexing, NTFS/MFT enumeration, USN Journal updates, true fuzzy matching, and filesystem change tracking are **planned**, not implemented.
+> **Status: desktop MVP with an independent, bounded in-memory index.** FSearch provides an egui desktop interface, batched background index construction and reusable generation-tagged **session snapshots**, plus a compatible CLI. Persistent indexing, NTFS/MFT enumeration, USN Journal updates, true fuzzy matching, and filesystem change tracking are **planned**, not implemented.
 
 ## Why FSearch?
 
@@ -25,6 +25,7 @@ We aim to make file-name and path searching fast without treating file-content i
 | Exact name / exact path | Yes | Separate literal, case-sensitive modes |
 | File-name / full-path substring | Yes | Contiguous literal matches, not fuzzy |
 | Background queries | Yes | 175 ms debounce and session scan cache; changed queries do not trigger a new scan |
+| Index progress / health | Yes | Building, partial and stale snapshots; same-root rebuild failure retains the previous snapshot |
 | Progress / cancellation | Yes | Cooperative; cannot abort an OS operation already in progress |
 | Results and navigation | Yes | Sorted by native path in desktop; virtualized list, file/directory filters, open/reveal/copy |
 | Interface preferences | Session only | Light/dark theme, UI scale, English/Chinese when a local CJK font is available |
@@ -33,7 +34,9 @@ We aim to make file-name and path searching fast without treating file-content i
 | Real fuzzy matching | **No** | Future scored, non-contiguous matching |
 | Live file change updates | **No** | Rescan manually to reflect changes |
 
-The desktop displays at most **20,000 matching rows** while retaining the total match count. **This is a display limit, not an index-memory limit.** The current full scan is held in memory. No broad performance or memory claims have been benchmarked.
+The desktop displays at most **20,000 matching rows**, with a full match count **within the active snapshot**. Partial/building snapshots never claim to cover the entire tree. Index construction stops explicitly at **1,000,000 entries** or **128 MiB of retained native path storage** by default; traversal and diagnostic storage have separate budgets. These are allocation policies, not a process-RAM cap: entry structures, shared batches, old/new snapshots during rebuild, queued events and allocator/OS overhead also consume memory.
+
+See [index semantics and memory policy](docs/indexing.md) and the [reproducible measured baseline](docs/index-baseline.md). The baseline distinguishes generated fixtures, an explicitly scoped existing tree, warm caches, sorted result collection and process peak memory; it is not a cross-platform performance guarantee.
 
 ## Getting started
 
@@ -70,6 +73,8 @@ cargo run -p fsearch-desktop --release --locked -- \
 | `--directory PATH` | `-d` | Optional scan root; when supplied, the scan starts automatically |
 | `--query TEXT` | `-q` | Initial search text (default: empty) |
 | `--mode MODE` | — | `exact-name`, `exact-path`, `name-substring` (default), or `path-substring` |
+| `--max-index-entries N` | — | Entry budget per build (default: `1000000`); reaching it with more candidates produces a partial index |
+| `--max-index-path-bytes N` | — | Native path storage budget per build (default: `134217728`); not a process-RAM limit |
 
 The search modes are always case-sensitive in this version.
 
@@ -126,11 +131,11 @@ A **future fuzzy mode** may match non-adjacent characters, e.g. `rptpdf` → `re
                       |
                 UI command/events
                       |
-             background worker
+             background coordinator
                  /         \
-      iterative scanner   literal matcher
+        batched builder   literal query API
                \          /
-                session snapshot
+             core IndexSnapshot
                       |
            filtered/virtualized rows
 ```
@@ -139,18 +144,20 @@ The workspace keeps the filesystem/search core separate from frontends:
 
 ```text
 crates/
-  fsearch-core/       native path scan + literal matching; no external dependencies
+  fsearch-core/       native path scan + bounded index + literal query; no external dependencies
   fsearch-cli/        compatible command-line interface (binary: search)
   fsearch-desktop/    egui/eframe GUI, background jobs, platform file actions
 ```
 
-The desktop scans into an in-memory snapshot, searches it on subsequent queries, and rescans only on request or when a new root is selected. This is **not** a persistent or automatically updated filesystem index.
+The core index stores original native paths in shared immutable batches. Entry identity is a build generation plus observation ordinal; publication revisions grow within a build. These IDs are session/build scoped, not persistent filesystem IDs. Queries run entirely in memory and return globally native-path-sorted capped rows with a full snapshot match count.
+
+During a same-root rebuild, the usable old snapshot remains searchable and is labelled stale. A failed, cancelled or limited rebuild keeps it; a different original root spelling clears it. Without an old snapshot, bounded batch previews and any final partial data are usable with explicit incompleteness. Diagnostics and failure/stale warnings survive later queries. A successful scan means traversal completed without observed errors; files may change during or after it. There is **no watcher, atomic filesystem snapshot, persistent cache or automatic freshness detection**.
 
 ## Roadmap: toward Everything-style speed
 
 **The target architecture is a persistent/indexed search engine, not a faster `read_dir` loop on every keystroke.** Work will be incremental and benchmark driven.
 
-1. **Index foundation:** separate queryable snapshots from scan reports; define file identity, status/freshness, bounded memory, query workloads, and baseline benchmarks.
+1. **Index foundation (implemented):** independent batched snapshots, generation-scoped entry identity, explicit partial/stale states, allocation budgets, query workloads and a repeatable Windows baseline. Wider large-tree/platform measurements remain open.
 2. **Windows NTFS fast path:** evaluate supported volume enumeration using `FSCTL_ENUM_USN_DATA` (backed by NTFS file records/MFT metadata), track updates using `FSCTL_QUERY_USN_JOURNAL` and `FSCTL_READ_USN_JOURNAL`, and reconstruct parent/file relationships safely. Handle journal resets, gaps, renames, hard links and offline volumes with a rebuild path.
 3. **Cross-platform fallback:** retain the portable iterative directory scanner for Linux, macOS, non-NTFS volumes, network drives, and cases where Windows volume access is unavailable. Optional native change watchers must support error/overflow reconciliation.
 4. **Real fuzzy search:** scored non-contiguous matches, deterministic relevance ranking, explicit case/Unicode behavior, and performance regression tests.
@@ -165,7 +172,7 @@ See [AGENTS.md](AGENTS.md) for detailed architecture boundaries, indexing correc
 - There is no true fuzzy, persistent index, file watcher, configurable case policy, native folder picker, or exclusion/settings persistence.
 - Native-path display or text copy may be lossy for malformed Unicode paths; scanning, matching, and file operations retain native path values.
 - Scan completeness is best-effort under concurrent filesystem changes. Partially inaccessible subtrees are reported; a completed session snapshot can become stale.
-- Scanning and cancellation are cooperative. Very large scans still consume memory proportional to discovered entries; the 20,000-row UI cap does not change that.
+- Scanning and cancellation are cooperative. Index limits stop traversal and mark the result partial; increasing them raises memory use. Rebuilds retaining an old snapshot use both builds' budgets. The legacy CLI keeps its existing unbounded scan report.
 - On Linux, “reveal” opens the containing folder without guaranteed item selection. The current Windows item-selection API path has a 259 UTF-16-unit limit.
 - Platform-specific behavior needs further real-device validation. Earlier development notes reported local Windows testing on 2026-10-11, but that does not by itself validate the current head on Linux/macOS or establish benchmark numbers.
 

@@ -1,0 +1,384 @@
+{
+  "schema": 1,
+  "measuredAtUtc": "2026-10-17T12:06:23.9596154Z",
+  "operatingSystem": "Microsoft Windows 11 专业版",
+  "osVersion": "10.0.26300",
+  "architecture": "64 位",
+  "cpu": "12th Gen Intel(R) Core(TM) i5-12600KF",
+  "logicalProcessors": 16,
+  "rust": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "profile": "release; workspace lto=true, debug=false, panic=abort",
+  "binaryBytes": 229888,
+  "cachePolicy": "No OS cache flush. Generated fixture is warm from creation; first means first index build in the measured process. Rebuild and queries are warm.",
+  "queryPolicy": "10 warmups then nearest-rank p50/p95; four modes; 20,000 displayed indices with full match count; all entries filter. Exact queries sample up to nine native entries plus a miss. Mixed substrings: report, 資料, café, .txt, .rs, 000, dir-, empty, [literal], and a miss. Separate empty_all and miss workloads are also measured for each substring mode.",
+  "fixture": {
+    "directories": 200,
+    "generationMs": 13537.117,
+    "contents": "zero bytes",
+    "files": 50000
+  },
+  "datasets": [
+    {
+      "records": [
+        {
+          "kind": "memory",
+          "phase": "baseline",
+          "working_set_bytes": 4718592,
+          "peak_working_set_bytes": 4718592,
+          "private_committed_bytes": 737280
+        },
+        {
+          "kind": "build",
+          "phase": "first",
+          "elapsed_ms": 1267.902,
+          "entries": 50200,
+          "issues": 0,
+          "path_bytes": 4975800,
+          "entry_storage_lower_bound_bytes": 7787000,
+          "publications": 25,
+          "generation": 1,
+          "revision": 25
+        },
+        {
+          "kind": "memory",
+          "phase": "indexed",
+          "working_set_bytes": 13692928,
+          "peak_working_set_bytes": 13692928,
+          "private_committed_bytes": 9814016
+        },
+        {
+          "kind": "build",
+          "phase": "rebuild_with_old_snapshot",
+          "elapsed_ms": 1463.141,
+          "entries": 50200,
+          "issues": 0,
+          "path_bytes": 4975800,
+          "entry_storage_lower_bound_bytes": 7787000,
+          "publications": 25,
+          "generation": 2,
+          "revision": 25
+        },
+        {
+          "kind": "memory",
+          "phase": "two_snapshots",
+          "working_set_bytes": 22073344,
+          "peak_working_set_bytes": 22073344,
+          "private_committed_bytes": 18407424
+        },
+        {
+          "kind": "memory",
+          "phase": "one_snapshot_after_rebuild",
+          "working_set_bytes": 13791232,
+          "peak_working_set_bytes": 22073344,
+          "private_committed_bytes": 11157504
+        },
+        {
+          "kind": "query",
+          "mode": "exact_name",
+          "workload": "mixed",
+          "iterations": 100,
+          "warmups": 10,
+          "p50_us": 979.2,
+          "p95_us": 1240.2,
+          "checksum": 99
+        },
+        {
+          "kind": "query",
+          "mode": "exact_path",
+          "workload": "mixed",
+          "iterations": 100,
+          "warmups": 10,
+          "p50_us": 117.3,
+          "p95_us": 172.1,
+          "checksum": 99
+        },
+        {
+          "kind": "query",
+          "mode": "name_substring",
+          "workload": "mixed",
+          "iterations": 100,
+          "warmups": 10,
+          "p50_us": 4095.6,
+          "p95_us": 13618.6,
+          "checksum": 2094510
+        },
+        {
+          "kind": "query",
+          "mode": "name_substring",
+          "workload": "empty_all",
+          "iterations": 100,
+          "warmups": 10,
+          "p50_us": 11892.3,
+          "p95_us": 13143.8,
+          "checksum": 5522000
+        },
+        {
+          "kind": "query",
+          "mode": "name_substring",
+          "workload": "miss",
+          "iterations": 100,
+          "warmups": 10,
+          "p50_us": 946.6,
+          "p95_us": 1046.8,
+          "checksum": 0
+        },
+        {
+          "kind": "query",
+          "mode": "path_substring",
+          "workload": "mixed",
+          "iterations": 100,
+          "warmups": 10,
+          "p50_us": 11019.1,
+          "p95_us": 20244.3,
+          "checksum": 2644510
+        },
+        {
+          "kind": "query",
+          "mode": "path_substring",
+          "workload": "empty_all",
+          "iterations": 100,
+          "warmups": 10,
+          "p50_us": 10932.9,
+          "p95_us": 11303.8,
+          "checksum": 5522000
+        },
+        {
+          "kind": "query",
+          "mode": "path_substring",
+          "workload": "miss",
+          "iterations": 100,
+          "warmups": 10,
+          "p50_us": 7240.2,
+          "p95_us": 7625.4,
+          "checksum": 0
+        },
+        {
+          "kind": "check",
+          "name": "build_cancellation",
+          "threshold_reached": true,
+          "entries": 512,
+          "elapsed_ms": 12.633
+        },
+        {
+          "kind": "check",
+          "name": "entry_limit",
+          "entries": 32,
+          "partial": true,
+          "query_cancelled": true
+        },
+        {
+          "kind": "check",
+          "name": "query_after_root_removed",
+          "passed": true
+        },
+        {
+          "kind": "memory",
+          "phase": "idle_after_queries",
+          "working_set_bytes": 14536704,
+          "peak_working_set_bytes": 22073344,
+          "private_committed_bytes": 11554816
+        },
+        {
+          "kind": "idle",
+          "wall_ms": 250.208,
+          "cpu_ms": 0.0
+        },
+        {
+          "kind": "memory",
+          "phase": "idle_250ms",
+          "working_set_bytes": 14548992,
+          "peak_working_set_bytes": 22073344,
+          "private_committed_bytes": 11554816
+        }
+      ],
+      "label": "generated fixture",
+      "storage": {
+        "model": "KIOXIA-EXCERIA G2 SSD",
+        "medium": "SSD",
+        "bus": "NVMe",
+        "fileSystem": "NTFS"
+      }
+    },
+    {
+      "records": [
+        {
+          "kind": "memory",
+          "phase": "baseline",
+          "working_set_bytes": 4718592,
+          "peak_working_set_bytes": 4718592,
+          "private_committed_bytes": 737280
+        },
+        {
+          "kind": "build",
+          "phase": "first",
+          "elapsed_ms": 111.48,
+          "entries": 3713,
+          "issues": 0,
+          "path_bytes": 375664,
+          "entry_storage_lower_bound_bytes": 583592,
+          "publications": 2,
+          "generation": 1,
+          "revision": 2
+        },
+        {
+          "kind": "memory",
+          "phase": "indexed",
+          "working_set_bytes": 5775360,
+          "peak_working_set_bytes": 5775360,
+          "private_committed_bytes": 1658880
+        },
+        {
+          "kind": "build",
+          "phase": "rebuild_with_old_snapshot",
+          "elapsed_ms": 83.443,
+          "entries": 3713,
+          "issues": 0,
+          "path_bytes": 375664,
+          "entry_storage_lower_bound_bytes": 583592,
+          "publications": 2,
+          "generation": 2,
+          "revision": 2
+        },
+        {
+          "kind": "memory",
+          "phase": "two_snapshots",
+          "working_set_bytes": 6344704,
+          "peak_working_set_bytes": 6455296,
+          "private_committed_bytes": 2224128
+        },
+        {
+          "kind": "memory",
+          "phase": "one_snapshot_after_rebuild",
+          "working_set_bytes": 5779456,
+          "peak_working_set_bytes": 6455296,
+          "private_committed_bytes": 1658880
+        },
+        {
+          "kind": "query",
+          "mode": "exact_name",
+          "workload": "mixed",
+          "iterations": 100,
+          "warmups": 10,
+          "p50_us": 86.3,
+          "p95_us": 88.9,
+          "checksum": 165
+        },
+        {
+          "kind": "query",
+          "mode": "exact_path",
+          "workload": "mixed",
+          "iterations": 100,
+          "warmups": 10,
+          "p50_us": 3.5,
+          "p95_us": 4.2,
+          "checksum": 99
+        },
+        {
+          "kind": "query",
+          "mode": "name_substring",
+          "workload": "mixed",
+          "iterations": 100,
+          "warmups": 10,
+          "p50_us": 237.7,
+          "p95_us": 689.2,
+          "checksum": 40920
+        },
+        {
+          "kind": "query",
+          "mode": "name_substring",
+          "workload": "empty_all",
+          "iterations": 100,
+          "warmups": 10,
+          "p50_us": 687.8,
+          "p95_us": 695.8,
+          "checksum": 408430
+        },
+        {
+          "kind": "query",
+          "mode": "name_substring",
+          "workload": "miss",
+          "iterations": 100,
+          "warmups": 10,
+          "p50_us": 100.4,
+          "p95_us": 103.6,
+          "checksum": 0
+        },
+        {
+          "kind": "query",
+          "mode": "path_substring",
+          "workload": "mixed",
+          "iterations": 100,
+          "warmups": 10,
+          "p50_us": 604.9,
+          "p95_us": 811.2,
+          "checksum": 40920
+        },
+        {
+          "kind": "query",
+          "mode": "path_substring",
+          "workload": "empty_all",
+          "iterations": 100,
+          "warmups": 10,
+          "p50_us": 594.4,
+          "p95_us": 627.6,
+          "checksum": 408430
+        },
+        {
+          "kind": "query",
+          "mode": "path_substring",
+          "workload": "miss",
+          "iterations": 100,
+          "warmups": 10,
+          "p50_us": 575.9,
+          "p95_us": 602.9,
+          "checksum": 0
+        },
+        {
+          "kind": "check",
+          "name": "build_cancellation",
+          "threshold_reached": true,
+          "entries": 512,
+          "elapsed_ms": 12.134
+        },
+        {
+          "kind": "check",
+          "name": "entry_limit",
+          "entries": 32,
+          "partial": true,
+          "query_cancelled": true
+        },
+        {
+          "kind": "check",
+          "name": "query_after_root_removed",
+          "passed": true
+        },
+        {
+          "kind": "memory",
+          "phase": "idle_after_queries",
+          "working_set_bytes": 5918720,
+          "peak_working_set_bytes": 6455296,
+          "private_committed_bytes": 1789952
+        },
+        {
+          "kind": "idle",
+          "wall_ms": 250.376,
+          "cpu_ms": 0.0
+        },
+        {
+          "kind": "memory",
+          "phase": "idle_250ms",
+          "working_set_bytes": 5926912,
+          "peak_working_set_bytes": 6455296,
+          "private_committed_bytes": 1789952
+        }
+      ],
+      "label": "explicit existing tree",
+      "storage": {
+        "model": "KIOXIA-EXCERIA G2 SSD",
+        "medium": "SSD",
+        "bus": "NVMe",
+        "fileSystem": "NTFS"
+      }
+    }
+  ]
+}

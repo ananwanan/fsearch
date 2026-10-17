@@ -1,7 +1,8 @@
 use crate::model::{move_selection, Phase, ViewState};
 use crate::platform::{load_cjk_font, Action, PlatformWorker};
-use crate::worker::{EntryFilter, EntryKind, Query, Worker};
+use crate::worker::{EntryFilter, EntryKind, Event, Query, Worker};
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText};
+use fsearch_core::index::{IndexHealth, IndexLimits};
 use fsearch_core::SearchMode;
 use std::io;
 use std::ops::Range;
@@ -15,6 +16,7 @@ const ACCENT: Color32 = Color32::from_rgb(110, 218, 180);
 
 pub struct SearchApp {
     worker: Worker,
+    limits: IndexLimits,
     platform: PlatformWorker,
     state: ViewState,
     root: PathBuf,
@@ -42,6 +44,7 @@ impl SearchApp {
         directory: Option<PathBuf>,
         query: String,
         mode: SearchMode,
+        limits: IndexLimits,
     ) -> io::Result<Self> {
         let cjk_available = if let Some(font) = load_cjk_font() {
             let mut fonts = egui::FontDefinitions::default();
@@ -63,7 +66,7 @@ impl SearchApp {
         };
         configure_style(&cc.egui_ctx, true);
         let worker_ctx = cc.egui_ctx.clone();
-        let worker = Worker::new(move || worker_ctx.request_repaint())?;
+        let worker = Worker::new(move || worker_ctx.request_repaint(), limits)?;
         let platform_ctx = cc.egui_ctx.clone();
         let platform = PlatformWorker::new(move || platform_ctx.request_repaint())?;
         let auto_scan = directory.is_some();
@@ -76,6 +79,7 @@ impl SearchApp {
             root,
             root_edited: false,
             worker,
+            limits,
             platform,
             state: ViewState::default(),
             query,
@@ -123,7 +127,9 @@ impl SearchApp {
             self.root = PathBuf::from(&self.root_text);
             self.root_edited = false;
         }
-        self.state.begin_scan();
+        let previous = self.state.snapshot.clone();
+        self.state.begin_scan(&self.root);
+        self.retire_replaced(previous);
         self.query_deadline = None;
         self.notice = None;
         self.scroll_selection = true;
@@ -155,7 +161,15 @@ impl SearchApp {
     fn drain_events(&mut self) {
         // The channels are bounded; processing does not traverse the full snapshot.
         while let Ok(event) = self.worker.events.try_recv() {
+            let previous = self.state.snapshot.clone();
+            let offered = match &event {
+                Event::Published { snapshot, .. } => Some(Arc::clone(snapshot)),
+                Event::Finished { snapshot, .. } => snapshot.clone(),
+                _ => None,
+            };
             self.state.apply(event);
+            self.retire_replaced(previous);
+            self.retire_replaced(offered);
         }
         while let Ok(event) = self.platform.events.try_recv() {
             self.notice = Some(event.error.unwrap_or_else(|| {
@@ -169,6 +183,19 @@ impl SearchApp {
         }
     }
 
+    fn retire_replaced(&self, previous: Option<Arc<fsearch_core::index::IndexSnapshot>>) {
+        if let Some(previous) = previous {
+            if !self
+                .state
+                .snapshot
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &previous))
+            {
+                self.worker.retire(previous);
+            }
+        }
+    }
+
     fn submit_debounced_query(&mut self, ctx: &egui::Context) {
         let Some(deadline) = self.query_deadline else {
             return;
@@ -179,7 +206,7 @@ impl SearchApp {
             return;
         }
         self.query_deadline = None;
-        if self.state.has_snapshot || self.state.phase == Phase::Scanning {
+        if self.state.has_snapshot() || self.state.phase == Phase::Scanning {
             self.worker.query(
                 self.state.scan_generation,
                 self.state.query_generation,
@@ -191,7 +218,7 @@ impl SearchApp {
     fn selected_path(&self) -> Option<PathBuf> {
         let row = self.state.selected?;
         let index = *self.state.indices.get(row)?;
-        Some(self.state.entries.get(index)?.path.clone())
+        Some(self.state.entry(index)?.path.clone())
     }
 
     fn open_selected(&mut self, reveal: bool) {
@@ -415,19 +442,35 @@ impl SearchApp {
                         if ui.button(text(zh, "Copy path", "复制路径")).clicked() { self.copy_selected(ctx); }
                     });
                     if let Some(row) = self.state.selected {
-                        if let Some(entry) = self.state.indices.get(row).and_then(|i| self.state.entries.get(*i)) {
-                            ui.add(egui::Label::new(RichText::new(&entry.display_path).small()).truncate())
-                                .on_hover_text(&entry.display_path);
+                        if let Some(entry) = self.state.indices.get(row).and_then(|i| self.state.snapshot.as_ref()?.get(*i)) {
+                            ui.add(egui::Label::new(RichText::new(entry.path.to_string_lossy()).small()).truncate())
+                                .on_hover_text(entry.path.to_string_lossy());
                         }
                     }
                 });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.colored_label(if self.state.phase == Phase::Failed { Color32::from_rgb(241, 135, 135) } else { accent(ui) }, self.status_text());
-                    if self.state.issues > 0 {
-                        ui.colored_label(Color32::from_rgb(233, 183, 105), format!("{} {}", self.state.issues, text(zh, "scan issues · partial results", "处扫描问题 · 结果可能不完整")));
+                    if self.state.progress.issues > 0 {
+                        ui.colored_label(Color32::from_rgb(233, 183, 105), format!("{} {}", self.state.progress.issues, text(zh, "scan issues · partial results", "处扫描问题 · 结果可能不完整")));
                     }
                 });
+                if let Some(snapshot) = &self.state.snapshot {
+                    let health = if self.state.stale {
+                        text(zh, "Stale snapshot · refresh required", "快照已过期 · 请重新扫描")
+                    } else {
+                        match snapshot.health() {
+                            IndexHealth::Building => text(zh, "Building · incomplete snapshot", "构建中 · 索引尚不完整"),
+                            IndexHealth::Partial => text(zh, "Partial index · counts cover retained entries only", "部分索引 · 命中数仅覆盖已保留条目"),
+                            IndexHealth::Current => text(zh, "Scan complete · changes are not monitored", "扫描完成 · 未监听后续文件变更"),
+                        }
+                    };
+                    ui.small(format!("{} · #{} / {} · {:.1} MiB {}", health, snapshot.generation(), snapshot.revision(), snapshot.progress().path_bytes as f64 / 1_048_576.0, text(zh, "native paths", "原生路径")));
+                    if self.state.stale && snapshot.health() != IndexHealth::Current {
+                        ui.small(text(zh, "Retained snapshot is also incomplete; counts cover retained entries only.", "保留的快照同样不完整；命中数仅覆盖已保留条目。"));
+                    }
+                }
+                if let Some(failure) = &self.state.failure { ui.colored_label(Color32::from_rgb(241, 135, 135), failure); }
                 if let Some(notice) = &self.notice { ui.small(notice); }
                 if !self.state.diagnostics.is_empty() {
                     egui::CollapsingHeader::new(text(zh, "Error details", "错误详情")).show(ui, |ui| {
@@ -451,10 +494,11 @@ impl SearchApp {
             )
             .to_owned(),
             Phase::Scanning => format!(
-                "{} {} {}",
-                text(zh, "Scanning…", "正在扫描…"),
-                self.state.visited,
-                text(zh, "entries", "个条目")
+                "{} {} {} · {:.1} MiB",
+                text(zh, "Building index…", "正在构建索引…"),
+                self.state.progress.entries,
+                text(zh, "entries", "个条目"),
+                self.state.progress.path_bytes as f64 / 1_048_576.0
             ),
             Phase::Querying => {
                 text(zh, "Searching the scanned entries…", "正在搜索已扫描条目…").to_owned()
@@ -463,8 +507,11 @@ impl SearchApp {
                 "{} {} · {} {}",
                 self.state.total_matches,
                 text(zh, "matches", "个匹配"),
-                self.state.entries.len(),
-                text(zh, "scanned entries", "个已扫描条目")
+                self.state
+                    .snapshot
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.len()),
+                text(zh, "indexed entries", "个索引条目")
             ),
             Phase::Cancelled => text(
                 zh,
@@ -540,7 +587,9 @@ impl SearchApp {
                     return;
                 }
                 let count = self.state.indices.len();
-                let entries = Arc::clone(&self.state.entries);
+                let Some(entries) = self.state.snapshot.clone() else {
+                    return;
+                };
                 let mut scroll = egui::ScrollArea::vertical()
                     .id_salt("results")
                     .auto_shrink([false, false]);
@@ -567,7 +616,11 @@ impl SearchApp {
                                 egui::WidgetType::SelectableLabel,
                                 true,
                                 selected,
-                                &entry.name,
+                                entry
+                                    .path
+                                    .file_name()
+                                    .unwrap_or(entry.path.as_os_str())
+                                    .to_string_lossy(),
                             )
                         });
                         if selected || response.hovered() || row % 2 == 0 {
@@ -597,14 +650,23 @@ impl SearchApp {
                                                 .color(accent(ui)),
                                         );
                                         ui.add(
-                                            egui::Label::new(RichText::new(&entry.name).strong())
-                                                .truncate(),
+                                            egui::Label::new(
+                                                RichText::new(
+                                                    entry
+                                                        .path
+                                                        .file_name()
+                                                        .unwrap_or(entry.path.as_os_str())
+                                                        .to_string_lossy(),
+                                                )
+                                                .strong(),
+                                            )
+                                            .truncate(),
                                         );
                                     },
                                 );
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(&entry.display_path)
+                                        RichText::new(entry.path.to_string_lossy())
                                             .color(ui.visuals().weak_text_color()),
                                     )
                                     .truncate(),
@@ -622,7 +684,7 @@ impl SearchApp {
                             self.open_selected(false);
                         }
                         response
-                            .on_hover_text(&entry.display_path)
+                            .on_hover_text(entry.path.to_string_lossy())
                             .context_menu(|ui| {
                                 self.state.selected = Some(row);
                                 if ui.button(text(zh, "Open", "打开")).clicked() {
@@ -677,6 +739,9 @@ impl SearchApp {
                         "Chinese needs an installed CJK font (Noto Sans CJK / Microsoft YaHei).",
                     );
                 }
+                ui.separator();
+                ui.small(format!("{}: {} / {:.0} MiB", text(zh, "Index entry / path limits", "索引条目 / 路径限额"), self.limits.max_entries, self.limits.max_path_bytes as f64 / 1_048_576.0));
+                ui.small(text(zh, "Limits stop the build as partial. Rebuilds can retain two snapshots. This is not a process RAM cap.", "超限会停止构建并标记不完整。重建可同时保留两份快照；此限额不是进程总内存上限。"));
                 ui.separator();
                 ui.small(text(
                     zh,

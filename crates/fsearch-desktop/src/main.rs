@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use clap::{Parser, ValueEnum};
-use fsearch_core::SearchMode;
+use fsearch_core::{IndexLimits, SearchMode};
 use std::path::PathBuf;
 
 mod app;
@@ -21,6 +21,12 @@ struct Args {
     /// Initial literal matching mode (always case-sensitive)
     #[arg(long, value_enum, default_value = "name-substring")]
     mode: InitialMode,
+    /// Stop indexing at this many entries; stopped builds are explicitly partial
+    #[arg(long, default_value_t = IndexLimits::default().max_entries)]
+    max_index_entries: usize,
+    /// Maximum retained native path bytes per build (not a process RAM limit)
+    #[arg(long, default_value_t = IndexLimits::default().max_path_bytes)]
+    max_index_path_bytes: usize,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -60,6 +66,11 @@ fn main() -> eframe::Result<()> {
                 args.directory,
                 args.query,
                 args.mode.into(),
+                IndexLimits {
+                    max_entries: args.max_index_entries,
+                    max_path_bytes: args.max_index_path_bytes,
+                    ..IndexLimits::default()
+                },
             )?))
         }),
     )

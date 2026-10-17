@@ -129,25 +129,7 @@ pub fn scan_path_with(
         });
     }
     let root = root.as_ref();
-    // Validate the caller's spelling using the OS's path rules first.
-    let metadata = fs::symlink_metadata(root).map_err(|error| ScanIssue {
-        path: root.to_path_buf(),
-        operation: ScanOperation::ReadMetadata,
-        error,
-    })?;
-    // A trailing separator or `.` would make the OS traverse a final directory
-    // link during that validation. Inspect the final component separately before
-    // deciding to enumerate: candidates and errors keep the caller's spelling.
-    let metadata_path: PathBuf = root.components().collect();
-    let metadata = if metadata_path.as_os_str() == root.as_os_str() {
-        metadata
-    } else {
-        fs::symlink_metadata(&metadata_path).map_err(|error| ScanIssue {
-            path: root.to_path_buf(),
-            operation: ScanOperation::ReadMetadata,
-            error,
-        })?
-    };
+    let metadata = root_metadata(root)?;
 
     if !is_traversable_directory(&metadata) {
         report.paths.push(root.to_path_buf());
@@ -312,7 +294,28 @@ fn record_entries(
     });
 }
 
-fn is_traversable_directory(metadata: &Metadata) -> bool {
+pub(crate) fn root_metadata(root: &Path) -> Result<Metadata, ScanIssue> {
+    // Validate the caller's spelling before removing trailing separators/dots.
+    // Inspect that final component separately so a final directory link is not
+    // traversed. Preserve the original spelling for candidates and errors.
+    let metadata = fs::symlink_metadata(root).map_err(|error| ScanIssue {
+        path: root.to_path_buf(),
+        operation: ScanOperation::ReadMetadata,
+        error,
+    })?;
+    let metadata_path: PathBuf = root.components().collect();
+    if metadata_path.as_os_str() == root.as_os_str() {
+        Ok(metadata)
+    } else {
+        fs::symlink_metadata(metadata_path).map_err(|error| ScanIssue {
+            path: root.to_path_buf(),
+            operation: ScanOperation::ReadMetadata,
+            error,
+        })
+    }
+}
+
+pub(crate) fn is_traversable_directory(metadata: &Metadata) -> bool {
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return false;
     }

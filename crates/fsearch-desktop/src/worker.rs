@@ -1,11 +1,13 @@
-//! A single background worker with replaceable requests and bounded UI events.
+//! Replaceable background builds/queries with bounded UI events.
 
-use fsearch_core::search::matches_path;
-use fsearch_core::{scan_path_with, SearchMode};
-use std::ffi::OsStr;
-use std::fs;
+use fsearch_core::index::{
+    build_index, IndexBuildEvent, IndexHealth, IndexLimits, IndexProgress, IndexSnapshot,
+    SearchQuery,
+};
+pub use fsearch_core::index::{EntryFilter, EntryKind};
+use fsearch_core::SearchMode;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -13,31 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const RESULT_LIMIT: usize = 20_000;
-const DIAGNOSTIC_LIMIT: usize = 64;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
-
-#[derive(Debug)]
-pub struct Entry {
-    pub path: PathBuf,
-    pub name: String,
-    pub display_path: String,
-    pub kind: EntryKind,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum EntryKind {
-    File,
-    Directory,
-    Link,
-    Other,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum EntryFilter {
-    All,
-    Files,
-    Directories,
-}
 
 #[derive(Debug, Clone)]
 pub struct Query {
@@ -50,27 +28,28 @@ pub struct Query {
 pub enum Event {
     Progress {
         scan_generation: u64,
-        entries: usize,
-        issues: usize,
+        progress: IndexProgress,
     },
-    Scanned {
+    Published {
         scan_generation: u64,
-        entries: Arc<Vec<Entry>>,
-        issues: usize,
+        snapshot: Arc<IndexSnapshot>,
+    },
+    Finished {
+        scan_generation: u64,
+        snapshot: Option<Arc<IndexSnapshot>>,
+        stale: bool,
+        cancelled: bool,
+        progress: IndexProgress,
         diagnostics: Vec<String>,
+        failure: Option<String>,
     },
     Results {
         scan_generation: u64,
         query_generation: u64,
+        snapshot_generation: u64,
+        snapshot_revision: u64,
         indices: Vec<usize>,
         total_matches: usize,
-    },
-    Failed {
-        scan_generation: u64,
-        message: String,
-    },
-    Cancelled {
-        scan_generation: u64,
     },
 }
 
@@ -79,6 +58,7 @@ struct ScanRequest {
     root: PathBuf,
 }
 
+#[derive(Clone)]
 struct QueryRequest {
     scan_generation: u64,
     generation: u64,
@@ -89,6 +69,7 @@ struct QueryRequest {
 struct Mailbox {
     scan: Option<ScanRequest>,
     query: Option<QueryRequest>,
+    retired: Vec<Arc<IndexSnapshot>>,
 }
 
 struct Shared {
@@ -140,13 +121,12 @@ impl Shared {
             Event::Progress {
                 scan_generation, ..
             }
-            | Event::Scanned {
-                scan_generation, ..
-            }
-            | Event::Failed {
+            | Event::Published {
                 scan_generation, ..
             } => self.scanning(*scan_generation),
-            Event::Cancelled { scan_generation } => self.current_scan(*scan_generation),
+            Event::Finished {
+                scan_generation, ..
+            } => self.current_scan(*scan_generation),
             Event::Results {
                 scan_generation,
                 query_generation,
@@ -164,13 +144,20 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> io::Result<Self> {
+    pub fn new(wake: impl Fn() + Send + Sync + 'static, limits: IndexLimits) -> io::Result<Self> {
+        Self::with_limits(wake, limits)
+    }
+
+    fn with_limits(
+        wake: impl Fn() + Send + Sync + 'static,
+        limits: IndexLimits,
+    ) -> io::Result<Self> {
         let shared = Arc::new(Shared::new());
         let (sender, events) = mpsc::sync_channel(8);
         let background = Arc::clone(&shared);
         let handle = thread::Builder::new()
             .name("fsearch-background".into())
-            .spawn(move || run(background, sender, wake))?;
+            .spawn(move || run(background, sender, wake, limits))?;
         drop(handle);
         Ok(Self { shared, events })
     }
@@ -216,6 +203,13 @@ impl Worker {
         self.shared.changed.notify_one();
     }
 
+    /// Transfer released snapshots so their final deallocation stays off egui.
+    pub fn retire(&self, snapshot: Arc<IndexSnapshot>) {
+        let mut mailbox = self.shared.mailbox();
+        mailbox.retired.push(snapshot);
+        self.shared.changed.notify_one();
+    }
+
     pub fn cancel_scan(&self) {
         self.shared.scan_cancelled.store(true, Ordering::Release);
         self.shared.query_cancelled.store(true, Ordering::Release);
@@ -240,13 +234,14 @@ impl Drop for Worker {
     }
 }
 
-fn run(shared: Arc<Shared>, sender: SyncSender<Event>, wake: impl Fn()) {
-    let mut cache: Option<(u64, Arc<Vec<Entry>>)> = None;
+fn run(shared: Arc<Shared>, sender: SyncSender<Event>, wake: impl Fn(), limits: IndexLimits) {
+    let mut cache: Option<Arc<IndexSnapshot>> = None;
     loop {
-        let (scan, query) = {
+        let (scan, query, retired) = {
             let mut mailbox = shared.mailbox();
             while mailbox.scan.is_none()
                 && mailbox.query.is_none()
+                && mailbox.retired.is_empty()
                 && !shared.shutdown.load(Ordering::Acquire)
             {
                 mailbox = shared
@@ -257,39 +252,58 @@ fn run(shared: Arc<Shared>, sender: SyncSender<Event>, wake: impl Fn()) {
             if shared.shutdown.load(Ordering::Acquire) {
                 return;
             }
+            let retired = std::mem::take(&mut mailbox.retired);
             if let Some(scan) = mailbox.scan.take() {
-                (Some(scan), None)
+                (Some(scan), None, retired)
             } else {
-                (None, mailbox.query.take())
+                (None, mailbox.query.take(), retired)
             }
         };
-
+        drop(retired);
         if let Some(scan) = scan {
-            cache = None;
-            if let Some(entries) = build_snapshot(&shared, &sender, &wake, &scan) {
-                cache = Some((scan.generation, entries));
+            // Scope reuse is deliberately strict: never use lossy spelling or
+            // canonicalize through the filesystem on the UI/render thread.
+            if cache
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.root().as_os_str() != scan.root.as_os_str())
+            {
+                cache = None;
             }
-        } else if let (Some(request), Some((generation, entries))) = (query, &cache) {
-            if request.scan_generation == *generation {
-                if let Some((indices, total_matches)) =
-                    collect_matches(entries, &request.query, || {
-                        shared.querying(request.scan_generation, request.generation)
-                    })
-                {
-                    deliver(
-                        &shared,
-                        &sender,
-                        &wake,
-                        Event::Results {
-                            scan_generation: request.scan_generation,
-                            query_generation: request.generation,
-                            indices,
-                            total_matches,
-                        },
-                    );
-                }
-            }
+            cache = build_snapshot(&shared, &sender, &wake, &scan, cache, limits);
+        } else if let (Some(request), Some(snapshot)) = (query, &cache) {
+            send_results(&shared, &sender, &wake, snapshot, &request);
         }
+    }
+}
+
+fn send_results(
+    shared: &Shared,
+    sender: &SyncSender<Event>,
+    wake: &impl Fn(),
+    snapshot: &IndexSnapshot,
+    request: &QueryRequest,
+) {
+    let query = SearchQuery {
+        text: request.query.text.clone().into(),
+        mode: request.query.mode,
+        filter: request.query.filter,
+    };
+    if let Some(results) = snapshot.query_with(&query, RESULT_LIMIT, || {
+        shared.querying(request.scan_generation, request.generation)
+    }) {
+        deliver(
+            shared,
+            sender,
+            wake,
+            Event::Results {
+                scan_generation: request.scan_generation,
+                query_generation: request.generation,
+                snapshot_generation: snapshot.generation(),
+                snapshot_revision: snapshot.revision(),
+                indices: results.indices,
+                total_matches: results.total_matches,
+            },
+        );
     }
 }
 
@@ -298,221 +312,125 @@ fn build_snapshot(
     sender: &SyncSender<Event>,
     wake: &impl Fn(),
     request: &ScanRequest,
-) -> Option<Arc<Vec<Entry>>> {
+    fallback: Option<Arc<IndexSnapshot>>,
+    limits: IndexLimits,
+) -> Option<Arc<IndexSnapshot>> {
     let generation = request.generation;
-    if !shared.scanning(generation) {
-        cancelled(shared, sender, wake, generation);
-        return None;
-    }
     let mut last_progress = Instant::now();
-    let outcome = match scan_path_with(&request.root, |progress| {
-        progress_event(
-            shared,
-            sender,
-            wake,
-            &mut last_progress,
-            generation,
-            progress.entries,
-            progress.issues,
-        );
-        shared.scanning(generation)
-    }) {
-        Ok(outcome) => outcome,
-        Err(issue) => {
-            if shared.scanning(generation) {
-                if !deliver(
-                    shared,
-                    sender,
-                    wake,
-                    Event::Failed {
-                        scan_generation: generation,
-                        message: issue.to_string(),
-                    },
-                ) {
-                    cancelled(shared, sender, wake, generation);
-                }
-            } else {
-                cancelled(shared, sender, wake, generation);
-            }
-            return None;
-        }
-    };
-    if outcome.cancelled || !shared.scanning(generation) {
-        cancelled(shared, sender, wake, generation);
-        return None;
-    }
-
-    let mut issues = outcome.report.issues.len();
-    let mut diagnostics: Vec<_> = outcome
-        .report
-        .issues
-        .iter()
-        .take(DIAGNOSTIC_LIMIT)
-        .map(ToString::to_string)
-        .collect();
-    let total_entries = outcome.report.paths.len();
-    let mut entries = Vec::with_capacity(total_entries);
-    for path in outcome.report.paths {
+    let mut last_publish = Instant::now();
+    let mut progress = IndexProgress::default();
+    let mut preview: Option<Arc<IndexSnapshot>> = None;
+    let mut last_query = None;
+    let outcome = build_index(&request.root, generation, limits, |event| {
         if !shared.scanning(generation) {
-            cancelled(shared, sender, wake, generation);
-            return None;
+            return false;
         }
-        let kind = match path_kind(&path) {
-            Ok(kind) => kind,
-            Err(error) => {
-                issues += 1;
-                if diagnostics.len() < DIAGNOSTIC_LIMIT {
-                    diagnostics.push(format!("read metadata '{}': {error}", path.display()));
+        match event {
+            IndexBuildEvent::Progress(update) => {
+                progress = update;
+                if last_progress.elapsed() >= PROGRESS_INTERVAL {
+                    last_progress = Instant::now();
+                    let retired = std::mem::take(&mut shared.mailbox().retired);
+                    drop(retired);
+                    if sender
+                        .try_send(Event::Progress {
+                            scan_generation: generation,
+                            progress,
+                        })
+                        .is_ok()
+                    {
+                        wake();
+                    }
+                    // One pending query is serviced against the old snapshot
+                    // during a rebuild; this work remains on the background thread.
+                    if let Some(snapshot) = fallback.as_ref().or(preview.as_ref()) {
+                        let query = shared.mailbox().query.clone();
+                        if let Some(query) = query {
+                            if last_query != Some(query.generation) {
+                                send_results(shared, sender, wake, snapshot, &query);
+                                last_query = Some(query.generation);
+                            }
+                        }
+                    }
                 }
-                EntryKind::Other
             }
-        };
-        let name = path
-            .file_name()
-            .unwrap_or(path.as_os_str())
-            .to_string_lossy()
-            .into_owned();
-        let display_path = path.to_string_lossy().into_owned();
-        entries.push(Entry {
-            path,
-            name,
-            display_path,
-            kind,
-        });
-        progress_event(
-            shared,
-            sender,
-            wake,
-            &mut last_progress,
-            generation,
-            total_entries,
-            issues,
-        );
-    }
-    if !shared.scanning(generation) {
-        cancelled(shared, sender, wake, generation);
-        return None;
-    }
-    // Raw path spelling is the deterministic tie-breaker, including names that
-    // happen to produce identical lossy display strings.
-    entries.sort_unstable_by(|left, right| left.path.as_os_str().cmp(right.path.as_os_str()));
-    if !shared.scanning(generation) {
-        cancelled(shared, sender, wake, generation);
-        return None;
-    }
-    if issues > diagnostics.len() {
-        diagnostics.push(format!(
-            "{} additional issues are omitted",
-            issues - diagnostics.len()
-        ));
-    }
-    let entries = Arc::new(entries);
-    if deliver(
-        shared,
-        sender,
-        wake,
-        Event::Scanned {
-            scan_generation: generation,
-            entries: Arc::clone(&entries),
-            issues,
-            diagnostics,
-        },
-    ) {
-        Some(entries)
-    } else {
-        cancelled(shared, sender, wake, generation);
-        None
-    }
-}
-
-fn path_kind(path: &Path) -> io::Result<EntryKind> {
-    // The scanner has already validated the original spelling. A trailing `/`
-    // or `/.` can make symlink_metadata inspect a directory link's target;
-    // remove those components only for classification, retaining the raw entry.
-    let metadata_path: PathBuf = path.components().collect();
-    fs::symlink_metadata(metadata_path).map(|metadata| entry_kind(&metadata))
-}
-
-fn entry_kind(metadata: &fs::Metadata) -> EntryKind {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 {
-            return EntryKind::Link;
-        }
-    }
-    let kind = metadata.file_type();
-    if kind.is_symlink() {
-        EntryKind::Link
-    } else if kind.is_dir() {
-        EntryKind::Directory
-    } else if kind.is_file() {
-        EntryKind::File
-    } else {
-        EntryKind::Other
-    }
-}
-
-fn collect_matches(
-    entries: &[Entry],
-    query: &Query,
-    current: impl Fn() -> bool,
-) -> Option<(Vec<usize>, usize)> {
-    let mut indices = Vec::with_capacity(entries.len().min(RESULT_LIMIT));
-    let mut total_matches = 0;
-    let query_text = OsStr::new(&query.text);
-    for (index, entry) in entries.iter().enumerate() {
-        if index % 256 == 0 && !current() {
-            return None;
-        }
-        let included = match query.filter {
-            EntryFilter::All => true,
-            EntryFilter::Files => entry.kind == EntryKind::File,
-            EntryFilter::Directories => entry.kind == EntryKind::Directory,
-        };
-        if included && matches_path(&entry.path, query_text, query.mode) {
-            total_matches += 1;
-            if indices.len() < RESULT_LIMIT {
-                indices.push(index);
+            IndexBuildEvent::Published(snapshot) => {
+                progress = snapshot.progress();
+                if fallback.is_none()
+                    && (preview.is_none() || last_publish.elapsed() >= PROGRESS_INTERVAL)
+                {
+                    let snapshot = Arc::new(snapshot);
+                    if !deliver(
+                        shared,
+                        sender,
+                        wake,
+                        Event::Published {
+                            scan_generation: generation,
+                            snapshot: Arc::clone(&snapshot),
+                        },
+                    ) {
+                        return false;
+                    }
+                    preview = Some(Arc::clone(&snapshot));
+                    last_publish = Instant::now();
+                    // Clone the latest request rather than consuming it: the
+                    // terminal revision must also be searched after this batch.
+                    let query = shared.mailbox().query.clone();
+                    if let Some(query) = query {
+                        send_results(shared, sender, wake, &snapshot, &query);
+                    }
+                }
             }
         }
-    }
-    current().then_some((indices, total_matches))
-}
-
-fn progress_event(
-    shared: &Shared,
-    sender: &SyncSender<Event>,
-    wake: &impl Fn(),
-    last: &mut Instant,
-    generation: u64,
-    entries: usize,
-    issues: usize,
-) {
-    if last.elapsed() >= PROGRESS_INTERVAL && shared.scanning(generation) {
-        *last = Instant::now();
-        if sender
-            .try_send(Event::Progress {
-                scan_generation: generation,
-                entries,
-                issues,
-            })
-            .is_ok()
-        {
-            wake();
+        shared.scanning(generation)
+    });
+    let cancelled = !shared.scanning(generation);
+    let (snapshot, stale, diagnostics, failure) = match outcome {
+        Ok(built) => {
+            progress = built.progress();
+            let incomplete = built.health() != IndexHealth::Current;
+            let mut diagnostics: Vec<_> = built.issues().iter().map(ToString::to_string).collect();
+            if progress.issues > diagnostics.len() {
+                diagnostics.push(format!(
+                    "{} additional scan issues omitted",
+                    progress.issues - diagnostics.len()
+                ));
+            }
+            if let Some(reason) = built.stop_reason() {
+                diagnostics.push(format!("Index incomplete: {reason}. Limits stop enumeration; match counts cover retained entries only."));
+            }
+            let retaining_old = incomplete && fallback.is_some();
+            let snapshot = if retaining_old {
+                fallback
+            } else {
+                Some(Arc::new(built))
+            };
+            (snapshot, retaining_old || cancelled, diagnostics, None)
         }
-    }
-}
-
-fn cancelled(shared: &Shared, sender: &SyncSender<Event>, wake: &impl Fn(), generation: u64) {
+        Err(error) => (
+            fallback,
+            true,
+            vec![error.to_string()],
+            Some(error.to_string()),
+        ),
+    };
     deliver(
         shared,
         sender,
         wake,
-        Event::Cancelled {
+        Event::Finished {
             scan_generation: generation,
+            snapshot: snapshot.clone(),
+            stale,
+            cancelled,
+            progress,
+            diagnostics,
+            failure,
         },
     );
+    // Keep a valid same-scope snapshot even if delivery was superseded. The
+    // next request still validates its original root before any reuse.
+    snapshot
 }
 
 /// Final events have bounded backpressure. A stale request or shutdown releases
@@ -549,39 +467,31 @@ fn deliver(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
     use std::error::Error;
+    use std::fs;
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-
     struct TestDirectory(PathBuf);
-
     impl TestDirectory {
         fn new() -> io::Result<Self> {
             let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(io::Error::other)?
-                .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "fsearch-worker-{}-{timestamp}-{sequence}",
+                "fsearch-index-worker-{}-{sequence}",
                 std::process::id()
             ));
             fs::create_dir(&path)?;
             Ok(Self(path))
         }
     }
-
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             if let Err(error) = fs::remove_dir_all(&self.0) {
                 if error.kind() != io::ErrorKind::NotFound {
-                    eprintln!("Cannot remove worker fixture {:?}: {error}", self.0);
+                    eprintln!("Cannot remove worker fixture: {error}");
                 }
             }
         }
     }
-
     fn query(text: &str) -> Query {
         Query {
             text: text.into(),
@@ -589,240 +499,271 @@ mod tests {
             filter: EntryFilter::All,
         }
     }
-
     fn receive(worker: &Worker) -> Result<Event, Box<dyn Error>> {
-        Ok(worker.events.recv_timeout(Duration::from_secs(5))?)
+        Ok(worker.events.recv_timeout(Duration::from_secs(10))?)
     }
-
-    fn await_scanned(worker: &Worker, generation: u64) -> Result<Arc<Vec<Entry>>, Box<dyn Error>> {
+    fn finished(worker: &Worker, generation: u64) -> Result<Event, Box<dyn Error>> {
         loop {
-            match receive(worker)? {
-                Event::Scanned {
-                    scan_generation,
-                    entries,
-                    issues,
-                    ..
-                } if scan_generation == generation => {
-                    assert_eq!(issues, 0);
-                    return Ok(entries);
-                }
-                Event::Progress { .. } => {}
-                event => panic!("Unexpected event while awaiting snapshot: {event:?}"),
+            let event = receive(worker)?;
+            if matches!(&event, Event::Finished { scan_generation, .. } if *scan_generation == generation)
+            {
+                return Ok(event);
             }
         }
     }
-
-    fn await_results(
+    fn snapshot(worker: &Worker, generation: u64) -> Result<Arc<IndexSnapshot>, Box<dyn Error>> {
+        match finished(worker, generation)? {
+            Event::Finished {
+                snapshot: Some(snapshot),
+                stale: false,
+                failure: None,
+                ..
+            } => Ok(snapshot),
+            event => panic!("Unexpected completion: {event:?}"),
+        }
+    }
+    fn results(
         worker: &Worker,
         scan: u64,
         generation: u64,
     ) -> Result<(Vec<usize>, usize), Box<dyn Error>> {
         loop {
-            match receive(worker)? {
-                Event::Results {
-                    scan_generation,
-                    query_generation,
-                    indices,
-                    total_matches,
-                } if scan_generation == scan && query_generation == generation => {
-                    return Ok((indices, total_matches))
+            if let Event::Results {
+                scan_generation,
+                query_generation,
+                indices,
+                total_matches,
+                ..
+            } = receive(worker)?
+            {
+                if scan_generation == scan && query_generation == generation {
+                    return Ok((indices, total_matches));
                 }
-                Event::Progress { .. } => {}
-                event => panic!("Unexpected event while awaiting results: {event:?}"),
             }
         }
     }
-
-    #[test]
-    fn queries_reuse_sorted_cache_after_files_are_removed() -> Result<(), Box<dyn Error>> {
-        let directory = TestDirectory::new()?;
-        let first = directory.0.join("a.txt");
-        let second = directory.0.join("z.txt");
-        fs::write(&second, [])?;
-        fs::write(&first, [])?;
-        let worker = Worker::new(|| {})?;
-        worker.scan(1, 1, directory.0.clone(), query(""));
-        let entries = await_scanned(&worker, 1)?;
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].path, first);
-        assert_eq!(entries[1].path, second);
-        assert_eq!(await_results(&worker, 1, 1)?, (vec![0, 1], 2));
-        fs::remove_file(&first)?;
-        fs::remove_file(&second)?;
-        worker.query(1, 2, query("z.txt"));
-        assert_eq!(await_results(&worker, 1, 2)?, (vec![1], 1));
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn linked_directory_roots_keep_link_kind_and_original_spelling() -> Result<(), Box<dyn Error>> {
-        use std::os::unix::fs::symlink;
-
-        let directory = TestDirectory::new()?;
-        let target = directory.0.join("target");
-        fs::create_dir(&target)?;
-        fs::write(target.join("not-traversed.txt"), [])?;
-        let link = directory.0.join("link");
-        symlink(&target, &link)?;
-        let worker = Worker::new(|| {})?;
-
-        for (index, suffix) in ["", "/", "/."].into_iter().enumerate() {
-            let mut spelling = link.as_os_str().to_os_string();
-            spelling.push(suffix);
-            let root = PathBuf::from(spelling);
-            let scan_generation = index as u64 + 1;
-            let query_generation = scan_generation * 10;
-            worker.scan(scan_generation, query_generation, root.clone(), query(""));
-            let entries = await_scanned(&worker, scan_generation)?;
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].kind, EntryKind::Link);
-            assert_eq!(entries[0].path.as_os_str(), root.as_os_str());
-            assert_eq!(entries[0].display_path, root.to_string_lossy());
-            assert_eq!(
-                await_results(&worker, scan_generation, query_generation)?,
-                (vec![0], 1)
-            );
-
-            let mut directories = query("");
-            directories.filter = EntryFilter::Directories;
-            worker.query(scan_generation, query_generation + 1, directories);
-            assert_eq!(
-                await_results(&worker, scan_generation, query_generation + 1)?,
-                (Vec::new(), 0)
-            );
-        }
-        Ok(())
-    }
-
-    // Block only the first repaint callback, after a snapshot has been queued.
-    // This makes replacements deterministic without relying on filesystem speed.
-    fn gated_worker() -> io::Result<(Worker, mpsc::Sender<()>)> {
+    fn gated_worker(limits: IndexLimits) -> io::Result<(Worker, mpsc::Sender<()>)> {
         let (release, released) = mpsc::channel();
         let released = Mutex::new(Some(released));
-        let worker = Worker::new(move || {
-            let receiver = released
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take();
-            if let Some(receiver) = receiver {
-                let _ = receiver.recv_timeout(Duration::from_secs(5));
-            }
-        })?;
+        let worker = Worker::with_limits(
+            move || {
+                let receiver = released
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take();
+                if let Some(receiver) = receiver {
+                    let _ = receiver.recv_timeout(Duration::from_secs(10));
+                }
+            },
+            limits,
+        )?;
         Ok((worker, release))
+    }
+    fn await_preview(worker: &Worker) -> Result<(), Box<dyn Error>> {
+        loop {
+            if matches!(receive(worker)?, Event::Published { .. }) {
+                return Ok(());
+            }
+        }
     }
 
     #[test]
-    fn rapid_queries_replace_pending_query_without_replacing_scan() -> Result<(), Box<dyn Error>> {
+    fn queries_reuse_snapshot_without_disk_and_sort_native_paths() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new()?;
+        fs::write(directory.0.join("z.txt"), [])?;
+        fs::write(directory.0.join("a.txt"), [])?;
+        let worker = Worker::new(|| {}, IndexLimits::default())?;
+        worker.scan(1, 1, directory.0.clone(), query(""));
+        let snapshot = snapshot(&worker, 1)?;
+        let (indices, total) = results(&worker, 1, 1)?;
+        assert_eq!(total, 2);
+        let paths: Vec<_> = indices
+            .iter()
+            .map(|i| snapshot.get(*i).unwrap().path.as_path())
+            .collect();
+        assert_eq!(
+            paths,
+            [directory.0.join("a.txt"), directory.0.join("z.txt")]
+        );
+        fs::remove_dir_all(&directory.0)?;
+        worker.query(1, 2, query("z.txt"));
+        let (indices, total) = results(&worker, 1, 2)?;
+        assert_eq!(total, 1);
+        assert_eq!(
+            snapshot.get(indices[0]).unwrap().path.file_name(),
+            Some(std::ffi::OsStr::new("z.txt"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_rebuild_preserves_same_root_and_queries_old_generation() -> Result<(), Box<dyn Error>>
+    {
+        let directory = TestDirectory::new()?;
+        fs::write(directory.0.join("old.txt"), [])?;
+        let worker = Worker::new(|| {}, IndexLimits::default())?;
+        worker.scan(1, 1, directory.0.clone(), query(""));
+        let old = snapshot(&worker, 1)?;
+        results(&worker, 1, 1)?;
+        fs::remove_dir_all(&directory.0)?;
+        worker.scan(2, 2, directory.0.clone(), query("old"));
+        match finished(&worker, 2)? {
+            Event::Finished {
+                snapshot: Some(retained),
+                stale: true,
+                failure: Some(_),
+                ..
+            } => assert!(Arc::ptr_eq(&old, &retained)),
+            event => panic!("Unexpected rebuild: {event:?}"),
+        }
+        assert_eq!(results(&worker, 2, 2)?.1, 1);
+        worker.query(2, 3, query("old"));
+        assert_eq!(results(&worker, 2, 3)?.1, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_new_root_cannot_reuse_previous_scope() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new()?;
+        fs::write(directory.0.join("old.txt"), [])?;
+        let worker = Worker::new(|| {}, IndexLimits::default())?;
+        worker.scan(1, 1, directory.0.clone(), query(""));
+        snapshot(&worker, 1)?;
+        results(&worker, 1, 1)?;
+        worker.scan(2, 2, directory.0.join("missing"), query(""));
+        assert!(matches!(
+            finished(&worker, 2)?,
+            Event::Finished {
+                snapshot: None,
+                failure: Some(_),
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn limited_rebuild_retains_usable_old_snapshot_as_stale() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new()?;
+        fs::write(directory.0.join("old.txt"), [])?;
+        let worker = Worker::with_limits(
+            || {},
+            IndexLimits {
+                max_entries: 2,
+                ..IndexLimits::default()
+            },
+        )?;
+        worker.scan(1, 1, directory.0.clone(), query(""));
+        let old = snapshot(&worker, 1)?;
+        results(&worker, 1, 1)?;
+        for name in ["new-a.txt", "new-b.txt"] {
+            fs::write(directory.0.join(name), [])?;
+        }
+        worker.scan(2, 2, directory.0.clone(), query(""));
+        match finished(&worker, 2)? {
+            Event::Finished {
+                snapshot: Some(retained),
+                stale: true,
+                progress,
+                diagnostics,
+                ..
+            } => {
+                assert!(Arc::ptr_eq(&old, &retained));
+                assert_eq!(progress.entries, 2);
+                assert!(!diagnostics.is_empty());
+            }
+            event => panic!("Unexpected limited rebuild: {event:?}"),
+        }
+        assert_eq!(results(&worker, 2, 2)?.1, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rapid_queries_replace_pending_query_without_cancelling_scan() -> Result<(), Box<dyn Error>> {
         let directory = TestDirectory::new()?;
         fs::write(directory.0.join("latest.txt"), [])?;
-        let (worker, release) = gated_worker()?;
+        let (worker, release) = gated_worker(IndexLimits::default())?;
         worker.scan(1, 1, directory.0.clone(), query(""));
-        let entries = await_scanned(&worker, 1)?;
+        await_preview(&worker)?;
         for generation in 2..1_000 {
             worker.query(1, generation, query("absent"));
         }
         worker.query(1, 1_000, query("latest"));
         assert!(worker.shared.scanning(1));
         release.send(())?;
-        assert_eq!(await_results(&worker, 1, 1_000)?, (vec![0], 1));
-        assert_eq!(entries[0].name, "latest.txt");
+        snapshot(&worker, 1)?;
+        assert_eq!(results(&worker, 1, 1_000)?.1, 1);
         Ok(())
     }
 
     #[test]
-    fn newer_scope_discards_old_query_and_runs_its_latest_query() -> Result<(), Box<dyn Error>> {
+    fn newer_scope_discards_build_and_runs_latest_query() -> Result<(), Box<dyn Error>> {
         let first = TestDirectory::new()?;
         let second = TestDirectory::new()?;
         fs::write(first.0.join("old.txt"), [])?;
         fs::write(second.0.join("new.txt"), [])?;
-        let (worker, release) = gated_worker()?;
+        let (worker, release) = gated_worker(IndexLimits::default())?;
         worker.scan(1, 1, first.0.clone(), query("old"));
-        await_scanned(&worker, 1)?;
+        await_preview(&worker)?;
         worker.scan(2, 2, second.0.clone(), query("absent"));
         worker.query(2, 3, query("new"));
         release.send(())?;
-        let entries = await_scanned(&worker, 2)?;
-        assert_eq!(entries[0].path, second.0.join("new.txt"));
-        assert_eq!(await_results(&worker, 2, 3)?, (vec![0], 1));
+        let snapshot = snapshot(&worker, 2)?;
+        let (indices, total) = results(&worker, 2, 3)?;
+        assert_eq!(total, 1);
+        assert_eq!(
+            snapshot.get(indices[0]).unwrap().path,
+            second.0.join("new.txt")
+        );
         Ok(())
     }
 
     #[test]
-    fn pending_scan_can_be_cancelled_without_publishing_a_snapshot() -> Result<(), Box<dyn Error>> {
+    fn cancellation_keeps_first_build_partial_and_requeryable() -> Result<(), Box<dyn Error>> {
         let directory = TestDirectory::new()?;
-        fs::write(directory.0.join("file.txt"), [])?;
-        let (worker, release) = gated_worker()?;
+        for i in 0..30 {
+            fs::write(directory.0.join(format!("file-{i}.txt")), [])?;
+        }
+        let (worker, release) = gated_worker(IndexLimits {
+            batch_size: 1,
+            ..IndexLimits::default()
+        })?;
         worker.scan(1, 1, directory.0.clone(), query(""));
-        await_scanned(&worker, 1)?;
-        worker.scan(2, 2, directory.0.clone(), query(""));
+        await_preview(&worker)?;
         worker.cancel_scan();
         release.send(())?;
-        assert!(matches!(
-            receive(&worker)?,
-            Event::Cancelled { scan_generation: 2 }
-        ));
+        let count = match finished(&worker, 1)? {
+            Event::Finished {
+                snapshot: Some(snapshot),
+                stale: true,
+                cancelled: true,
+                ..
+            } => {
+                assert_eq!(snapshot.health(), IndexHealth::Partial);
+                assert!(snapshot.len() < 30);
+                snapshot.len()
+            }
+            event => panic!("Unexpected cancellation: {event:?}"),
+        };
+        worker.query(1, 2, query(""));
+        assert_eq!(results(&worker, 1, 2)?.1, count);
         Ok(())
     }
 
-    fn entry(index: usize, kind: EntryKind) -> Entry {
-        let name = format!("entry-{index:05}.txt");
-        Entry {
-            path: PathBuf::from(&name),
-            display_path: name.clone(),
-            name,
-            kind,
-        }
-    }
-
     #[test]
-    fn large_queries_count_all_matches_but_cap_indices() {
-        let entries: Vec<_> = (0..RESULT_LIMIT + 123)
-            .map(|index| entry(index, EntryKind::File))
-            .collect();
-        let (indices, total) = collect_matches(&entries, &query("entry"), || true).unwrap();
-        assert_eq!(total, RESULT_LIMIT + 123);
-        assert_eq!(indices.len(), RESULT_LIMIT);
-        assert_eq!(indices, (0..RESULT_LIMIT).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn large_queries_observe_cancellation_before_completing() {
-        let entries: Vec<_> = (0..4_096)
-            .map(|index| entry(index, EntryKind::File))
-            .collect();
-        let checks = Cell::new(0);
-        assert!(collect_matches(&entries, &query(""), || {
-            checks.set(checks.get() + 1);
-            checks.get() < 3
-        })
-        .is_none());
-        assert_eq!(checks.get(), 3);
-    }
-
-    #[test]
-    fn filters_keep_links_and_other_entries_only_in_all() {
-        let entries = [
-            entry(0, EntryKind::File),
-            entry(1, EntryKind::Directory),
-            entry(2, EntryKind::Link),
-            entry(3, EntryKind::Other),
-        ];
-        let mut request = query("");
-        assert_eq!(
-            collect_matches(&entries, &request, || true).unwrap(),
-            (vec![0, 1, 2, 3], 4)
-        );
-        request.filter = EntryFilter::Files;
-        assert_eq!(
-            collect_matches(&entries, &request, || true).unwrap(),
-            (vec![0], 1)
-        );
-        request.filter = EntryFilter::Directories;
-        assert_eq!(
-            collect_matches(&entries, &request, || true).unwrap(),
-            (vec![1], 1)
-        );
+    fn query_cancellation_does_not_cancel_build() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new()?;
+        fs::write(directory.0.join("file.txt"), [])?;
+        let (worker, release) = gated_worker(IndexLimits::default())?;
+        worker.scan(1, 1, directory.0.clone(), query(""));
+        await_preview(&worker)?;
+        worker.cancel_query();
+        assert!(worker.shared.scanning(1));
+        release.send(())?;
+        snapshot(&worker, 1)?;
+        worker.query(1, 2, query("file"));
+        assert_eq!(results(&worker, 1, 2)?.1, 1);
+        Ok(())
     }
 
     #[test]
@@ -833,8 +774,7 @@ mod tests {
         let (sender, _receiver) = mpsc::sync_channel(1);
         sender.send(Event::Progress {
             scan_generation: 1,
-            entries: 0,
-            issues: 0,
+            progress: IndexProgress::default(),
         })?;
         let (started, started_rx) = mpsc::channel();
         let (done, done_rx) = mpsc::channel();
@@ -849,6 +789,8 @@ mod tests {
                 Event::Results {
                     scan_generation: 1,
                     query_generation: 1,
+                    snapshot_generation: 1,
+                    snapshot_revision: 1,
                     indices: vec![],
                     total_matches: 0,
                 },
@@ -859,6 +801,155 @@ mod tests {
         shared.query_generation.store(2, Ordering::Release);
         assert!(!done_rx.recv_timeout(Duration::from_secs(5))?);
         assert!(thread.join().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn superseded_terminal_delivery_keeps_fallback_for_next_same_root_rebuild(
+    ) -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new()?;
+        fs::write(directory.0.join("old.txt"), [])?;
+        let old = Arc::new(build_index(
+            &directory.0,
+            1,
+            IndexLimits::default(),
+            |_| true,
+        )?);
+        fs::remove_dir_all(&directory.0)?;
+
+        let shared = Arc::new(Shared::new());
+        shared.scan_generation.store(2, Ordering::Release);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        // Hold terminal delivery under backpressure so supersession occurs
+        // after the build's current-generation check, without timing sleeps.
+        sender.send(Event::Progress {
+            scan_generation: 2,
+            progress: IndexProgress::default(),
+        })?;
+        let (blocked, blocked_rx) = mpsc::channel();
+        let (done, done_rx) = mpsc::channel();
+        let background = Arc::clone(&shared);
+        let background_sender = sender.clone();
+        let fallback = Arc::clone(&old);
+        let root = directory.0.clone();
+        let thread = thread::spawn(move || {
+            let kept = build_snapshot(
+                &background,
+                &background_sender,
+                &|| {
+                    let _ = blocked.send(());
+                },
+                &ScanRequest {
+                    generation: 2,
+                    root,
+                },
+                Some(fallback),
+                IndexLimits::default(),
+            );
+            let _ = done.send(kept);
+        });
+        blocked_rx.recv_timeout(Duration::from_secs(5))?;
+        shared.scan_generation.store(3, Ordering::Release);
+        let kept = done_rx.recv_timeout(Duration::from_secs(5))?;
+        assert!(thread.join().is_ok());
+        assert!(kept.as_ref().is_some_and(|kept| Arc::ptr_eq(kept, &old)));
+        receiver.recv_timeout(Duration::from_secs(5))?;
+
+        let retained = build_snapshot(
+            &shared,
+            &sender,
+            &|| {},
+            &ScanRequest {
+                generation: 3,
+                root: directory.0.clone(),
+            },
+            kept,
+            IndexLimits::default(),
+        );
+        assert!(retained
+            .as_ref()
+            .is_some_and(|retained| Arc::ptr_eq(retained, &old)));
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(5))?,
+            Event::Finished {
+                scan_generation: 3,
+                snapshot: Some(_),
+                stale: true,
+                failure: Some(_),
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn superseded_current_first_build_remains_same_root_fallback() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new()?;
+        let old_path = directory.0.join("old.txt");
+        fs::write(&old_path, [])?;
+        // A tiny build publishes its terminal Current snapshot before the
+        // worker checks whether another scan superseded the request.
+        let (worker, release) = gated_worker(IndexLimits::default())?;
+        worker.scan(1, 1, directory.0.clone(), query(""));
+        let published = loop {
+            match receive(&worker)? {
+                Event::Published {
+                    scan_generation: 1,
+                    snapshot,
+                } => break snapshot,
+                Event::Progress { .. } => {}
+                event => panic!("Unexpected event before gated publication: {event:?}"),
+            }
+        };
+        assert_eq!(published.health(), IndexHealth::Current);
+        assert_eq!(published.generation(), 1);
+        assert_eq!(published.len(), 1);
+
+        worker.scan(2, 2, directory.0.clone(), query("old"));
+        fs::remove_dir_all(&directory.0)?;
+        release.send(())?;
+        match finished(&worker, 2)? {
+            Event::Finished {
+                snapshot: Some(retained),
+                stale: true,
+                failure: Some(_),
+                ..
+            } => {
+                assert_eq!(retained.generation(), 1);
+                assert_eq!(retained.revision(), published.revision());
+                assert_eq!(retained.health(), IndexHealth::Current);
+                assert_eq!(retained.root().as_os_str(), directory.0.as_os_str());
+                assert_eq!(retained.len(), 1);
+                assert_eq!(retained.get(0).map(|entry| &entry.path), Some(&old_path));
+            }
+            event => panic!("Superseded first build lost its applicable snapshot: {event:?}"),
+        }
+        assert_eq!(results(&worker, 2, 2)?.1, 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_root_retains_native_spelling_and_kind() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new()?;
+        let target = directory.0.join("target");
+        fs::create_dir(&target)?;
+        fs::write(target.join("unscanned.txt"), [])?;
+        let link = directory.0.join("link");
+        std::os::unix::fs::symlink(&target, &link)?;
+        let worker = Worker::new(|| {}, IndexLimits::default())?;
+        for (i, suffix) in ["", "/", "/."].iter().enumerate() {
+            let mut raw = link.clone().into_os_string();
+            raw.push(suffix);
+            let root = PathBuf::from(raw);
+            let generation = i as u64 + 1;
+            worker.scan(generation, generation, root.clone(), query(""));
+            let snapshot = snapshot(&worker, generation)?;
+            assert_eq!(snapshot.len(), 1);
+            assert_eq!(snapshot.get(0).unwrap().path.as_os_str(), root.as_os_str());
+            assert_eq!(snapshot.get(0).unwrap().kind, EntryKind::Link);
+            results(&worker, generation, generation)?;
+        }
         Ok(())
     }
 }

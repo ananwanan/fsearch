@@ -14,7 +14,7 @@ FSearch is a **small, polished, fast desktop file-name and path search applicati
 
 Never advertise an unimplemented feature as shipping. Avoid unrelated refactors, artificial abstractions, or a wholesale rewrite.
 
-## 2. Repository snapshot (2026-10-11)
+## 2. Repository snapshot (2026-10-17)
 
 The repository is a Rust **2021 Cargo virtual workspace** with `resolver = "2"` and three crates. Root `default-members` selects only the CLI, not the desktop app.
 
@@ -27,6 +27,8 @@ crates/
     src/lib.rs                  public, UI-independent scan/match API
     src/scanner.rs              iterative scan, native paths, issues, progress, cancellation
     src/search.rs               four literal search modes, unit tests
+    src/index.rs                bounded batched snapshots, identity, health, queries
+    examples/index_baseline.rs  std-only reproducible performance harness
   fsearch-cli/
     src/args.rs                 legacy CLI args
     src/main.rs                 executable: search
@@ -35,7 +37,7 @@ crates/
     src/main.rs                 eframe/Glow launcher and startup flags
     src/app.rs                  egui UI, preferences, keyboard/mouse interactions
     src/model.rs                view state, generation checks, selection/cancel logic
-    src/worker.rs               background scanning, session cache, filtering, queries
+    src/worker.rs               background index coordinator, bounded events, queries
     src/platform.rs             background file-open/reveal actions, optional system fonts
 README.md                       English user documentation
 README.zh-CN.md                 Chinese user documentation
@@ -49,8 +51,8 @@ Current manifests specify `eframe 0.36.2` with default features disabled and `ac
 - Iterative, one-off scanning via `scan_path` / `scan_path_with`. `ScanReport` preserves native `PathBuf` entries and structured `ScanIssue` records; `ScanProgress` and `ScanOutcome` support cooperative cancellation. Roots that are individual files/links are accepted. A directory root itself is not included. Symlinks and Windows reparse points (including junctions) are not traversed by default. No atomic no-follow guarantee exists across metadata checks and subsequent opens.
 - `SearchMode::{ExactName, ExactPath, NameSubstring, PathSubstring}`, `find_paths`, and `matches_path`. **All four modes are literal, case-sensitive, non-normalizing, and non-fuzzy.** Name modes operate on the final path component; path modes operate on the complete, original path spelling. Substrings are contiguous matches using native encoded bytes. Empty substring queries match all applicable entries; empty exact queries match no normal entries. Core and CLI preserve scan order.
 - Legacy `search` CLI: required `-d/--directory` and `-f/--filename`; its default behavior is **full-path substring**, despite the historic flag name. Root failure is an error (exit 1), recoverable child failures print `Scan incomplete` and also exit 1 while preserving partial results, empty/no matches exit 0, and clap argument errors exit 2. Matches still use `dbg!` on stderr; debug builds print timing on stdout when matches exist.
-- `fsearch-desktop`: optional `-d/--directory`, `-q/--query`, `--mode` = `exact-name` / `exact-path` / `name-substring` / `path-substring` (default). A specified root triggers scanning; otherwise the working directory is prefilled but scanning waits for user action. There is no native folder picker; users may paste or drop paths.
-- Desktop has a UI for the four modes, root and file/directory filtering; a **175 ms** query debounce; one background scan/query worker; separate scan/query generations, cooperative cancellation, an **8-event bounded channel**, approximately 100 ms progress updates, an `Arc`-shared in-session snapshot, stable native-path ordering, virtualized visible rows, and a **20,000-result display cap** with a full match count. The display cap does **not** cap scan/cache memory. New queries reuse the current snapshot rather than re-scanning.
+- `fsearch-desktop`: optional `-d/--directory`, `-q/--query`, `--mode` = `exact-name` / `exact-path` / `name-substring` (default) / `path-substring`. A specified root triggers scanning; otherwise the working directory is prefilled but scanning waits for user action. There is no native folder picker; users may paste or drop paths.
+- Desktop has a UI for the four modes, root and file/directory filtering; a **175 ms** query debounce; one background scan/query worker; separate scan/query generations, cooperative cancellation, an **8-event bounded channel**, approximately 100 ms progress updates, an `Arc`-shared in-session snapshot, stable native-path ordering, virtualized visible rows, and a **20,000-result display cap** with a full snapshot match count. The independent core index uses shared immutable batches (default 2,048 entries), generation-scoped entry IDs and publication revisions. Default build limits are 1,000,000 entries / 128 MiB native path storage, plus independent frontier and diagnostic budgets; limits stop traversal as Partial. New queries reuse snapshots without filesystem I/O. Same-original-root failed/partial/cancelled rebuilds retain the old snapshot with a stale warning; different raw roots cannot reuse it. Replaced snapshots are released on the worker to keep final deallocation off egui. Limits are not a process-RSS cap; old/new builds and bounded queued generations also consume memory. See `docs/indexing.md` and `docs/index-baseline.md`.
 - Actions run on a separate background worker: Windows Shell/PIDL open and reveal, macOS `open` / `open -R`, Linux `xdg-open`. Linux reveal opens the containing directory but may not select the item; Windows item selection currently has a 259 UTF-16-unit API limit. The app offers Ctrl+L, arrows, Enter/double-click, Ctrl+Shift+C, Ctrl+O, Ctrl+R, Escape; equivalent command shortcuts are used on macOS where appropriate. Light/dark, scale, and English/Chinese are **session-only**. Chinese availability depends on a discoverable local CJK font. Non-UTF-8 display/copy may be lossy even though core filesystem operations preserve native paths.
 
 **Not implemented:** native MFT enumeration, USN Journal tracking, persistent or incremental indices, filesystem watchers, true fuzzy search/ranking, configurable case folding, glob/regex/content search, persistent settings, exclusion rules, native folder selection, or comprehensive large-tree benchmarks. Do not imply these exist.
@@ -162,7 +164,7 @@ This is an incremental plan, not a license for autonomous scope expansion:
 
 - **Foundation (largely implemented)**: separate core/CLI/desktop workspace; protect legacy CLI behavior; iterative native-path scanning, four literal modes, structured errors and tests. Remaining work: CLI mode/case options and deeper edge-case validation.
 - **Desktop MVP (implemented, needs wider verification)**: egui/eframe UI, debounced asynchronous queries, session scan cache, progress/cancellation, virtualized results, keyboard/platform actions, session settings.
-- **Indexing foundation (next)**: isolate a queryable index from the scan report; define identity, snapshot generation, health/freshness, batch publishing, memory policy, and repeatable baseline benchmarks. Keep generic scanner usable.
+- **Indexing foundation (implemented, wider verification open)**: independent queryable batched snapshots, build-scoped identity/generations/revisions, partial/stale health, allocation budgets and repeatable Windows baseline. The generic scanner and legacy CLI remain usable. Persistence, true filesystem IDs, watchers and automatic freshness detection remain deferred.
 - **Fast Windows NTFS backend**: prototype `FSCTL_ENUM_USN_DATA` enumeration; robust journal checkpoints and `FSCTL_READ_USN_JOURNAL` delta handling, fallbacks and service/access policy; test correctness before optimizing.
 - **True fuzzy search**: explicit algorithm, ranked output, deterministic scores, optional normalization/case policy, benchmarks and UI mode; preserve literal modes.
 - **Portable updates and persistence**: optional watchers with recovery/rescan, versioned crash-safe index cache, settings/exclusion policy and user-visible stale states.
